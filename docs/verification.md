@@ -34,6 +34,13 @@ minor.
 
 ## The layers
 
+The opt-in middle cache has separate Go transport tests. Run `npm run test:middle-cache`
+with Go 1.26 or newer to check authorization on warm-cache and conditional requests,
+per-request headers and cookies, bounded eviction, path containment, streaming and
+WebSocket forwarding under the race detector. CI runs this command's Go equivalent in
+the Go build image. Node tests cover the handoff trust boundary and image staging.
+These checks do not establish live-cluster behavior or performance for this option.
+
 ### 1. Unit and schema suites
 
 Covers the adapter, both runtime tiers (pool server and routing service), the CLI, and the emitted
@@ -168,6 +175,74 @@ The specific behaviors the architecture exists to get right, each confirmed agai
 
 ## Known coverage gaps
 
+- **Already-open tabs can lose access to old build artifacts after cutover.** A local
+  Chromium comparison on 2026-09-17 with Next.js 16.3.4 exercised both promotion and
+  rollback against the pool runtime and `next start`. Navigation recovered onto the
+  current build, and current-build Server Actions worked. Previously unrequested lazy
+  chunks returned 404 with `ChunkLoadError`; stale Server Action IDs returned 404 with
+  `UnrecognizedActionError`. The comparison produced the same results with explicit
+  per-build deployment IDs. Neither failure automatically recovered. Enabling previous-build
+  retention now passes navigation, cold-chunk, stale-action, and current-action browser
+  checks in both cutover directions. The baseline without retention remains red.
+  This comparison switches a loopback proxy
+  between production builds; it does not verify Kubernetes, Envoy, or CDN behavior.
+- **Previous-build retention on live GKE.** A three-build run on September 17, 2026
+  exercised promotion, rollback, and superseded-build cleanup with middleware, the middle
+  cache, Envoy compression, and Cloud CDN enabled. All 61,824 continuous public probes
+  succeeded. Old tabs loaded cold chunks and ran actions once; middleware denied retained
+  requests; both shared and changed action IDs reached the correct build. After expiry,
+  an old chunk and an unknown action ID returned 404 without mutation replay. The final
+  fixture passed all 30 live checks and all 33 doctor checks. The load-balancer error
+  query returned no 5xx entries. This covers one pool and successful cloud operations;
+  standby capacity remained one replica after expiry. That run predates automatic scale-down.
+- **Automatic retention expiry on live GKE.** On September 18, 2026, the scheduled cleanup
+  job scaled the previous build to zero on its first run after the serving deadline,
+  about 33 seconds later. After all standby pods terminated, rollback restored two pods,
+  verified serving readiness, and moved traffic successfully. All 30 live checks passed
+  after rollback. The expiry and rollback phases recorded 26,262 public probes without
+  errors. This verifies one pool under successful cloud operations; unit tests cover
+  stale cleanup racing rollback and ambiguous cluster state.
+  The initial deployment did expose a separate routing-service drain problem: two HTTP
+  500s and nineteen 504s over 33 seconds coincided with the last old routing pod shutting
+  down. Load-balancer logs identified ext_proc `UNAVAILABLE` and `DEADLINE_EXCEEDED`,
+  before cleanup changed any replica counts. Zero-error deployment remains unproven.
+- **Routing readiness withdrawal on live GKE.** A follow-up on September 18, 2026
+  deployed two updated builds and rolled back under 51,126 normal requests and 9,426
+  middleware-denial requests. GKE reported the outgoing routing endpoints unhealthy
+  13–20 seconds after readiness
+  withdrawal; all four updated outgoing pods finished draining at 120 seconds without
+  forced teardown. The initial migration had no probe failures. The next deployment
+  produced four HTTP 504s, and rollback produced one, all confirmed as ext_proc
+  `DEADLINE_EXCEEDED`. All five occurred on the one-request-per-second keep-alive lane;
+  the faster request lanes and middleware-denial probes stayed clean. The rollback
+  timeout preceded routing readiness withdrawal, so pod shutdown alone does not explain
+  the remaining failures. Both updated builds and the restored build passed all 30 live
+  checks. Zero-error cutover is still unresolved.
+- **Callout timeout follow-up.** Request-ID tracing on the same fixture reproduced
+  two 504s in 11,548 requests without pod shutdown, including a fresh frontend
+  connection. Keeping a withdrawn pod alive produced one timeout in 15,250 requests;
+  that request reached a healthy pod after its public deadline, and Node wrote its
+  response about 2ms later. These failures are not explained by shutdown alone.
+  The default GKE callout deadline was also corrected from 4s to 5s around the existing
+  4000ms handler budget. A subsequent five-minute sample passed 10,669 requests, all
+  30 live tests, and 32 doctor checks. The cause of the delivery delay remains unresolved.
+- **Full cutover repeat with the five-second default.** Later on September 18, 2026,
+  two fresh deployments and rollback ran under 106,419 normal requests and 10,506
+  middleware-denial checks. Eight normal requests failed: three HTTP 500s with ext_proc
+  `UNAVAILABLE` and five HTTP 504s with `DEADLINE_EXCEEDED`. The first deployment had
+  four failures, the second one, and rollback three. All denial checks passed.
+  This run added fresh-connection probes to the earlier page, asset, and keep-alive
+  workload, so its failure rate is not a controlled before/after comparison.
+  All six outgoing routing pods became unhealthy in GCP within 11–19 seconds of
+  readiness withdrawal and completed their 120-second drain without forced teardown.
+  Each deployed or restored build passed all 30 live checks; final doctor passed 32/32.
+  Three correlated failures took 4.4–5.1 seconds to reach Node, which wrote responses
+  2–5ms later with no queued writes and available HTTP/2 flow-control capacity.
+  One used stream 1091 on an established session, so new connection setup alone
+  cannot explain the failures. The earliest 500 also preceded readiness withdrawal
+  and the traffic-extension update. The five-second default is verified through
+  deployment and rollback, but zero-error cutover remains unresolved. Temporary
+  diagnostic observers and inspector listeners were removed afterward.
 - **Full-topology runs are operator-initiated, not per-commit CI.** The cluster-topology
   suite (layer 2) covers the ext_proc path end to end, but it runs on a local k3d cluster
   when a maintainer launches it—hours, not minutes. Pull requests are gated by the unit,
@@ -204,6 +279,50 @@ The specific behaviors the architecture exists to get right, each confirmed agai
 - ext_proc path locally: `npx adapter-k8s emulate` in `fixtures/main`
 - Live suite: `E2E_BASE_URL=https://<host> npm run test:e2e:live` against a deployed release
 - Edge tier actually in use: add `E2E_ASSERT_EDGE_DISPATCH=1` to the live suite. It asserts the middleware that produced a response ran in the ext_proc tier — i.e. the pool VERIFIED the per-request dispatch proof rather than failing safe to local re-resolution, which is correct but silent and would otherwise leave the edge tier doing nothing but adding a hop. Requires a deployment built from the current `fixtures/main`
+
+Response compression has a real Envoy transport suite:
+`ADAPTER_K8S_CONTAINER_CLI=podman npx vitest run tests/emit/compression.integration.test.ts`.
+It defaults to Docker and skips when no runtime is available. The Linux-only suite uses
+loopback sockets and host networking, verifies codec negotiation and decoded payloads,
+streaming, range exclusions, response metadata and signed dispatch headers.
+
+### Browser continuity across builds
+
+```sh
+E2E_CONTINUITY_NEXT_VERSION=16.3.4 npm run test:e2e:continuity
+```
+
+Add `E2E_CONTINUITY_RETENTION=1` to build both fixtures with retention enabled and run
+the four adapter browser checks. This mode creates a signed local retention index and
+tests the real forwarding path; it does not run the Kubernetes publication procedure.
+Hermetic HTTP tests separately check middleware denial, index tampering, expiry, cookie
+preservation, concurrent reads, and no mutation replay after a reset. Cutover tests check
+publication order, signatures, and standby capacity against a scripted cluster.
+
+This maintainer command builds and packs the adapter once, installs the pinned Next
+version into two temporary copies of `fixtures/main`, and builds them with distinct
+content and Server Action IDs. It starts both builds under the pool server and
+`next start`, then uses a private headless Chromium profile and a loopback proxy to
+switch the serving build while a tab stays open. Both A-to-B promotion and B-to-A
+rollback run even if one direction fails. It also checks current-build Server Actions
+as a control. No cluster credentials or deployment are needed.
+
+Use Node 24 and a Chromium installation. Set `CHROMIUM_PATH` if the binary is not
+`/usr/bin/chromium`. Dependency installation needs registry access. The command fails
+when continuity breaks; it is separate from the hermetic unit suite and currently
+reports the known failures above. Browser caching is disabled to exercise cold asset
+requests. Successful warm-cache behavior is not evidence that old assets remain
+available at the origin.
+
+Set `E2E_CONTINUITY_DEPLOYMENT_IDS=1` to give the builds explicit `continuity-A` and
+`continuity-B` deployment IDs. Set `E2E_CONTINUITY_KEEP=1` to retain temporary build
+artifacts and logs; the command prints their location. To compare existing local HTTP
+origins built with `NEXT_PUBLIC_CONTINUITY_VERSION=A` and `B`, run only the test:
+
+```sh
+E2E_CONTINUITY_A=http://127.0.0.1:3001 E2E_CONTINUITY_B=http://127.0.0.1:3002 \
+  npx vitest run --config vitest.e2e-live.config.ts tests/e2e/live/continuity.test.ts
+```
 
 ## See also
 

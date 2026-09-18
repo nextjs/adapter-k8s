@@ -1,4 +1,7 @@
 // src/pool-server/index.ts
+import { handOffStaticAsset } from "./middle-cache.js";
+import { createRetentionReader } from "../retention.js";
+import { proxyRetainedBuild } from "./retention.js";
 import { createReadStream, readFileSync, existsSync, realpathSync, statSync } from "node:fs";
 import { pipeline } from "node:stream";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -1362,6 +1365,13 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     ? JSON.parse(readFileSync(staticAssetsPath, "utf-8"))
     : [];
   const staticAssetIndex = createStaticAssetIndex(staticAssets);
+  const middleAssetsByPath = new Map(
+    process.env.ADAPTER_K8S_MIDDLE_CACHE === "1"
+      ? staticAssets
+          .filter((asset) => !asset.prerender)
+          .map((asset) => [path.resolve(process.cwd(), asset.filePath), asset] as const)
+      : [],
+  );
   // Whether dispatch's static-manifest lookup would find this pathname (a SUBSET of
   // dispatch's own candidates — exact, trailing-slash variant, and the "/index" root
   // alias — so `true` here guarantees dispatch finds an entry). Public files now live
@@ -2031,6 +2041,13 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       : {}),
   });
 
+  const retainedBuild = createRetentionReader({
+    buildId,
+    ...(process.env.ADAPTER_K8S_RETENTION_FILE
+      ? { file: process.env.ADAPTER_K8S_RETENTION_FILE }
+      : {}),
+    ...(process.env.INTERNAL_HEADER_SECRET ? { secret: process.env.INTERNAL_HEADER_SECRET } : {}),
+  });
   handleRequest = async (req, res) => {
     let url: URL;
     try {
@@ -2051,6 +2068,19 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       // 500 — it's the client's own protocol error.
       res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
       res.end("Bad Request");
+      return;
+    }
+
+    const retained = await retainedBuild(
+      url,
+      req.method ?? "GET",
+      typeof req.headers["x-deployment-id"] === "string"
+        ? req.headers["x-deployment-id"]
+        : undefined,
+      typeof req.headers["next-action"] === "string" ? req.headers["next-action"] : undefined,
+    );
+    if (retained) {
+      await proxyRetainedBuild(req, res, retained.origin, retained.responseHeadTimeoutMs);
       return;
     }
 
@@ -2316,6 +2346,16 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         // Mirror Next's own server: service workers are revalidated (not immutable) and get
         // Service-Worker-Allowed; every other _next/static asset is immutable.
         const { cacheControl, headers } = nextStaticAssetHeaders(staticPathname, basePath);
+        const middleAsset = middleAssetsByPath.get(filePath);
+        if (
+          middleAsset &&
+          handOffStaticAsset(req, res, middleAsset, {
+            "content-type": getContentType(staticPathname),
+            "cache-control": cacheControl,
+            ...headers,
+          })
+        )
+          return;
         // S14: memoized per file — see staticAssetEtagForFile. Build chunks are immutable
         // within a build, so re-hashing them per request was pure waste (and a full
         // synchronous read of a multi-hundred-KiB chunk on the event loop each time).

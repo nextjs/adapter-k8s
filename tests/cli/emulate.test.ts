@@ -103,6 +103,17 @@ describe("renderEnvoyConfigForPort", () => {
     expect(renderEnvoyConfigForPort(source, 8080)).toBe(source);
   });
 
+  it("can disable compression while retaining middleware and routing filters", () => {
+    const checkedIn = new URL("../../integration/envoy.yaml", import.meta.url);
+    writeFileSync(source, readFileSync(checkedIn, "utf8"));
+    const out = renderEnvoyConfigForPort(source, 8080, false);
+    rendered.push(out);
+    const yaml = readFileSync(out, "utf8");
+    expect(yaml).not.toContain("envoy.filters.http.compressor.");
+    expect(yaml).toContain("envoy.filters.http.ext_proc");
+    expect(yaml).toContain("envoy.filters.http.router");
+  });
+
   it("returns the source path unchanged when the source does not exist", () => {
     const missing = path.join(tmpDir, "nope", "envoy.yaml");
     mkdirSync(path.dirname(missing), { recursive: true });

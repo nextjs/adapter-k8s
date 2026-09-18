@@ -10,6 +10,24 @@ import {
 } from "../../src/emit/dockerfiles.js";
 
 describe("emitted base image", () => {
+  it("builds the cache from each image layout and inherits it in pool deltas", () => {
+    const options = { buildId: "abc123", middleCache: true };
+    expect(generateDockerfile({ ...options, containerStrategy: "shared-image" })).toContain(
+      "COPY ./config/middle-cache.go ./main.go",
+    );
+    expect(generatePoolDockerfile({ ...options, poolName: "ssr" })).toContain(
+      "COPY context/config/middle-cache.go ./main.go",
+    );
+    expect(generatePoolBaseDockerfile(options)).toContain(
+      "COPY content/config/middle-cache.go ./main.go",
+    );
+    expect(generateLayeredPoolDockerfile({ buildId: "abc123", poolName: "ssr" })).not.toContain(
+      "golang:",
+    );
+    expect(generatePoolDockerfile({ buildId: "abc123", poolName: "ssr" })).not.toContain(
+      "middle-cache",
+    );
+  });
   it("pins the default emitted base image to node:24", () => {
     expect(DEFAULT_EMITTED_NODE_VERSION).toBe("24");
   });

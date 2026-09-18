@@ -1,3 +1,4 @@
+import { retentionEnv, retentionMount, retentionVolume } from "./retention.js";
 // src/emit/templates/deployment.ts
 import path from "node:path";
 import {
@@ -21,6 +22,7 @@ import { renderInternalSecretEnv } from "./internal-secret.js";
 import { renderValkeyEnv } from "./valkey-secret.js";
 import type { TargetArchitecture } from "../../target-platform.js";
 import { normalizeNextDistDir } from "../../next-runtime/dist-dir.js";
+import { COMPRESSION_ENVOY_IMAGE, compressionProxyConfig } from "../envoy-compression.js";
 
 /**
  * N63. Pod-termination timings for a NEG-backed pod, from Google's own guidance —
@@ -121,10 +123,13 @@ export function renderDeployment({
   env,
   envFrom,
   deploymentId,
+  retention = false,
   providerName,
   nodeArchitecture = "amd64",
   pullSecrets,
   distDir = ".next",
+  middleCache = false,
+  compression = true,
 }: {
   poolName: string;
   buildId: string;
@@ -168,6 +173,7 @@ export function renderDeployment({
    * pod must carry the exact build-time value.
    */
   deploymentId?: string;
+  retention?: boolean;
   /** Routing target component stamped onto adapter-owned OTEL signals. */
   providerName?: string;
   /** Literal architecture for this newly emitted build. */
@@ -180,6 +186,9 @@ export function renderDeployment({
   pullSecrets?: string[];
   /** Project-relative Next build directory carried by the routing manifest. */
   distDir?: string;
+  /** Go file-byte cache in this build's pod; all Services keep their existing port. */
+  middleCache?: boolean;
+  compression?: boolean;
 }): string {
   // Sanitize at the point of consumption (AGENTS.md). These three land in resource names,
   // label values, label SELECTORS, and `value: "…"` env scalars; none of them was checked
@@ -301,6 +310,98 @@ export function renderDeployment({
   // Registry pull auth (config imagePullSecrets) — empty string when unconfigured, so
   // charts for public registries stay byte-identical to before the surface existed.
   const pullSecretsBlock = renderImagePullSecrets(pullSecrets, "      ");
+  const middleCacheEnv =
+    (middleCache
+      ? `
+            - name: ADAPTER_K8S_MIDDLE_CACHE
+              value: "1"`
+      : "") +
+    (middleCache || compression
+      ? `
+            - name: PORT
+              value: "3001"
+            - name: ADAPTER_K8S_LISTEN_HOST
+              value: "127.0.0.1"`
+      : "");
+  const middleCacheContainer = middleCache
+    ? `        - name: middle-cache
+          image: "${imageRef}"
+          imagePullPolicy: ${imagePullPolicy}
+          command: ["/usr/local/bin/middle-cache"]
+          env:
+            - name: GOMEMLIMIT
+              value: "192MiB"
+            - name: MIDDLE_CACHE_LISTEN_ADDRESS
+              value: "${compression ? "127.0.0.1:3002" : ":3000"}"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - containerPort: ${compression ? 3002 : 3000}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep ${PRESTOP_DRAIN_SECONDS}"]
+          readinessProbe:
+            httpGet:
+              path: ${readinessPath}
+              port: 3000
+            periodSeconds: ${READINESS_PROBE_PERIOD_SECONDS}
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "1"
+              memory: "256Mi"
+`
+    : "";
+  const compressionContainer = compression
+    ? `        - name: compression
+          image: "${COMPRESSION_ENVOY_IMAGE}"
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/envoy"]
+          args:
+            - --config-yaml
+            - ${JSON.stringify(JSON.stringify(compressionProxyConfig(middleCache ? 3002 : 3001)))}
+            - --concurrency
+            - "2"
+            - --drain-time-s
+            - "60"
+            - --drain-strategy
+            - gradual
+            - --log-level
+            - warn
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - containerPort: 3000
+          lifecycle:
+            preStop:
+              exec:
+                # Keep serving during NEG drain, then drain existing connections alongside Node.
+                command: ["/bin/bash", "-c", "sleep ${PRESTOP_DRAIN_SECONDS}; printf 'POST /drain_listeners?graceful HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\nContent-Length: 0\\r\\n\\r\\n' > /dev/tcp/127.0.0.1/9901; sleep 60"]
+          readinessProbe:
+            httpGet:
+              path: ${readinessPath}
+              port: 3000
+            periodSeconds: ${READINESS_PROBE_PERIOD_SECONDS}
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "1"
+              memory: "128Mi"
+`
+    : "";
 
   return `apiVersion: apps/v1
 kind: Deployment
@@ -395,7 +496,7 @@ ${pullSecretsBlock}${nodeSelector}      securityContext:
               exec:
                 command: ["/bin/sh", "-c", "sleep ${PRESTOP_DRAIN_SECONDS}"]
           ports:
-            - containerPort: 3000
+            - containerPort: ${middleCache || compression ? 3001 : 3000}
           env:
             - name: NODE_ENV
               value: production
@@ -408,9 +509,9 @@ ${pullSecretsBlock}${nodeSelector}      securityContext:
             # can't reach sibling pools in any release not named that.
             - name: RELEASE_NAME
               value: "${releaseName}"
-${internalSecretEnv}${valkeyEnv}${deploymentIdEnv}${providerNameEnv}${userEnv}${userEnvFrom}
+${retention ? retentionEnv : ""}${internalSecretEnv}${valkeyEnv}${deploymentIdEnv}${providerNameEnv}${middleCacheEnv}${userEnv}${userEnvFrom}
           volumeMounts:
-            # readOnlyRootFilesystem makes / read-only; Next still needs a writable
+${retention ? retentionMount : ""}            # readOnlyRootFilesystem makes / read-only; Next still needs a writable
             # scratch dir, so /tmp is an emptyDir. NOT in-memory: a bare \`emptyDir: {}\`
             # is backed by the NODE's disk (an in-memory one needs \`medium: Memory\`,
             # which would charge the pages to the container's memory limit) — the comment
@@ -465,8 +566,8 @@ ${internalSecretEnv}${valkeyEnv}${deploymentIdEnv}${providerNameEnv}${userEnv}${
             limits:
               cpu: "${cpuLimit}"
               memory: "${memoryLimit}"
-      volumes:
-        - name: tmp
+${middleCacheContainer}${compressionContainer}      volumes:
+${retention ? retentionVolume(releaseName) : ""}        - name: tmp
           emptyDir:
             sizeLimit: ${TMP_SIZE_LIMIT}
         - name: next-cache

@@ -47,6 +47,9 @@ jobs:
       - name: Run unit tests
         run: npm test
 
+      - name: Test middle cache transport and races
+        run: docker run --rm -v "$PWD/docker/middle-cache:/work" -w /work golang:1.26-bookworm go test -race ./...
+
       - name: Audit dependencies
         run: npm audit --audit-level=low
 

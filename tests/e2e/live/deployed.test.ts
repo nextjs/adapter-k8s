@@ -141,7 +141,17 @@ describe("routes", () => {
       expect(response.headers.get("x-next-cache-tags")).toBeNull();
       return (JSON.parse(response.body) as { at: string }).at;
     };
-    const initial = await read();
+    // A previous live run may have left an entry beyond its revalidate time.
+    // Let that stale-while-revalidate response settle before testing invalidation.
+    // An uncached route still fails: it never produces two equal consecutive reads.
+    let initial = await read();
+    const settleDeadline = Date.now() + 5_000;
+    while (Date.now() < settleDeadline) {
+      const next = await read();
+      if (next === initial) break;
+      initial = next;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
     expect(await read()).toBe(initial);
 
     const invalidated = await req("/api/revalidate?tag=route-probe", { method: "POST" });

@@ -1,3 +1,5 @@
+import { prepareRetention } from "./retention.js";
+import { protectRetentionBuild } from "./retention-expiry.js";
 // src/cutover/run.ts
 // GitOps PR2: the cutover/promotion orchestrators, extracted from src/cli/deploy.ts step 7
 // (runCutover) and src/cli/rollback.ts steps 1-5 (runRevert). No TTY, no readline, no
@@ -99,6 +101,13 @@ export async function runCutover(inputs: CutoverInputs, deps: CutoverDeps): Prom
     deps,
   };
 
+  // Fence any old expiry job before this build's readiness checks can pass.
+  try {
+    await protectRetentionBuild(releaseName, namespace, buildId, pools);
+  } catch (error) {
+    await deps.restoreEdgeToPreviousBuild();
+    throw error;
+  }
   // D1. Wait for the new build's pool Deployments to be ready (7a).
   await waitPoolRollouts(ctx);
 
@@ -193,8 +202,18 @@ export async function runCutover(inputs: CutoverInputs, deps: CutoverDeps): Prom
     }
   }
 
+  let retainPrevious: Awaited<ReturnType<typeof prepareRetention>> = null;
+  try {
+    retainPrevious = await prepareRetention(releaseName, namespace, buildId, previousBuildId);
+  } catch (error) {
+    await deps.restoreEdgeToPreviousBuild();
+    await restoreWarmedHpas();
+    throw error;
+  }
+
   // E1 (7c). Cut traffic over: patch each active Service selector to the new build.
   await switchTrafficToNewBuild({
+    projectId: inputs.projectId,
     releaseName,
     namespace,
     safeBuildId,
@@ -335,6 +354,7 @@ export async function runCutover(inputs: CutoverInputs, deps: CutoverDeps): Prom
   // the HPA is chart-intended on every path out of this function. Scaling DOWN from here
   // is the autoscaler's decision under real load, bounded by the operator's config.
   await restoreWarmedHpas();
+  await retainPrevious?.complete();
 
   // E4 (7e). State is durable. Now invalidate the PREVIOUS build's Cloud CDN entries
   // (best-effort, non-fatal; TTL self-heals) so its stale content stops serving.
@@ -361,8 +381,15 @@ export async function runCutover(inputs: CutoverInputs, deps: CutoverDeps): Prom
     }
   }
 
-  // E5 (7f). Scale the previous build down to 0 (kept as the rollback target).
-  await scaleDownPreviousBuild({ releaseName, namespace, buildId, previousBuildId, previousPools });
+  // E5 (7f). Park the rollback target at zero, or one standby replica for retention.
+  await scaleDownPreviousBuild({
+    releaseName,
+    namespace,
+    buildId,
+    previousBuildId,
+    previousPools,
+    replicas: retainPrevious ? 1 : 0,
+  });
 
   // E6 (7g). GC superseded builds, retained stable groups, old route-ext Jobs,
   // snapshot/plan ConfigMaps, and unreferenced dispatch Secrets (N87).
@@ -402,6 +429,7 @@ export async function runRevert(inputs: RevertInputs): Promise<void> {
     registry,
   } = inputs;
 
+  await protectRetentionBuild(releaseName, namespace, previousBuildId, poolNames);
   // 1. Scale up every pool's previous deployment — to at least the capacity the CURRENT
   // build is running (N26), never the old hardcoded 2. Done BEFORE any selector flip so
   // the target is already at size when traffic arrives.
@@ -563,6 +591,13 @@ export async function runRevert(inputs: RevertInputs): Promise<void> {
     );
   }
 
+  const retainCurrent = await prepareRetention(
+    releaseName,
+    namespace,
+    previousBuildId,
+    currentBuildId,
+  );
+
   // 3b. Revert the routing tier (image + manifest) to the previous build BEFORE flipping
   // pool traffic — the same order deploy applies (edge first, selectors second), so the
   // middleware/manifest never trails the pools by more than one step.
@@ -579,6 +614,7 @@ export async function runRevert(inputs: RevertInputs): Promise<void> {
 
   // 4. Switch traffic: patch active Service selectors to the previous build (traffic.ts).
   await flipSelectorsToPreviousBuild({
+    projectId: inputs.projectId,
     releaseName,
     namespace,
     currentBuildId,
@@ -670,6 +706,8 @@ export async function runRevert(inputs: RevertInputs): Promise<void> {
     throw new CutoverExitError(1);
   }
 
+  await retainCurrent?.complete();
+
   // 4c. Traffic now points at the previous build and state is committed. Invalidate the CDN
   // entries tagged for the build we rolled AWAY from (currentBuildId) so its stale content
   // stops serving. Best-effort and non-fatal — a failure just lets the TTL self-heal.
@@ -697,5 +735,5 @@ export async function runRevert(inputs: RevertInputs): Promise<void> {
   }
 
   // 5. State is durable; scale down every former-current Deployment (gc.ts).
-  await scaleDownCurrentBuild({ namespace, currentDeploys });
+  await scaleDownCurrentBuild({ namespace, currentDeploys, replicas: retainCurrent ? 1 : 0 });
 }

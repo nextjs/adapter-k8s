@@ -6,6 +6,7 @@ import { renderInternalSecret } from "./templates/internal-secret.js";
 import { renderValkeySecret } from "./templates/valkey-secret.js";
 import { renderValuesYaml } from "./templates/values-yaml.js";
 import { renderDeployment } from "./templates/deployment.js";
+import { renderRetentionCleanup } from "./templates/retention-cleanup.js";
 import { renderService, renderActiveService, renderOriginService } from "./templates/service.js";
 import { renderHPA } from "./templates/hpa.js";
 import {
@@ -273,6 +274,16 @@ export function generateHelmChart({
       ? "envoy-native"
       : "gke-native";
 
+  if (config.retention?.enabled) {
+    files["templates/retention-cleanup.yaml"] = renderRetentionCleanup({
+      releaseName,
+      buildId,
+      poolName: defaultPool,
+      nodeArchitecture: targetArchitecture(targetPlatform),
+      ...(imageDigests?.[defaultPool] ? { imageDigest: imageDigests[defaultPool]! } : {}),
+      ...(pullSecrets ? { pullSecrets } : {}),
+    });
+  }
   for (const poolName of pools.keys()) {
     // Per-pool env merges OVER the shared map, and per-pool envFrom is appended AFTER the
     // shared sources — both match Kubernetes' own "last one wins" semantics, so a pool
@@ -281,6 +292,9 @@ export function generateHelmChart({
     const mergedEnv = { ...config.env, ...poolConfig?.env };
     const mergedEnvFrom = [...(config.envFrom ?? []), ...(poolConfig?.envFrom ?? [])];
     files[`templates/${poolName}-deployment.yaml`] = renderDeployment({
+      retention: config.retention?.enabled === true,
+      middleCache: config.middleCache?.enabled === true,
+      compression: config.compression?.enabled !== false,
       poolName,
       buildId,
       releaseName,
@@ -328,6 +342,7 @@ export function generateHelmChart({
   if (wantsRoutingTier) {
     const rs = config.routingService;
     files["templates/routing-service-deployment.yaml"] = renderRoutingServiceDeployment({
+      retention: config.retention?.enabled === true,
       releaseName,
       buildId,
       providerName: routingProviderName,

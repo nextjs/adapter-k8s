@@ -35,7 +35,10 @@ vi.mock("../../src/cli/state.js", async (importOriginal) => {
 import { runCutover } from "../../src/cutover/run.js";
 import { jobMain } from "../../src/cutover/job-main.js";
 import { CutoverExitError, type CutoverInputs } from "../../src/cutover/inputs.js";
-import { execCapture } from "../../src/cli/exec.js";
+import { execCapture, execCaptureStdin } from "../../src/cli/exec.js";
+import { inventorySignature, signRetention } from "../../src/retention.js";
+import { retentionName } from "../../src/emit/templates/retention.js";
+import { internalSecretName } from "../../src/emit/templates/internal-secret.js";
 import { readState, writeState } from "../../src/cli/state.js";
 import { invalidateCdnBuildTag } from "../../src/cli/cdn-invalidate.js";
 import { loadDeployedCompositionPlan } from "../../src/cli/composition-plan.js";
@@ -1297,5 +1300,134 @@ describe("jobMain — the poison pill", () => {
 
     expect(await jobMain(env())).not.toBe(0);
     expect(annotateCalls()).toEqual([]);
+  });
+});
+
+describe("retained build promotion", () => {
+  function retainedCluster(tamper = false) {
+    const base = cluster();
+    const inventory = (buildId: string) => ({
+      buildId,
+      deploymentId: buildId,
+      defaultPool: "ssr",
+      pools: ["ssr"],
+      gracePeriodSeconds: 300,
+      assets: [],
+      actions: [],
+    });
+    const before = {
+      [PREV]: signRetention(
+        [PREV, "buildm0"].map((buildId) => ({
+          ...inventory(buildId),
+          origin: `http://rel-ssr-${buildId}:3000`,
+          expiresAt: Date.now() + 60_000,
+        })),
+        `secret-${PREV}`,
+      ),
+    };
+    let index: any = {
+      apiVersion: "v1",
+      kind: "ConfigMap",
+      metadata: {
+        name: retentionName(RELEASE),
+        namespace: NS,
+        resourceVersion: "1",
+        labels: { "app.kubernetes.io/managed-by": "adapter-k8s" },
+      },
+      data: { "index.json": JSON.stringify(before) },
+    };
+    const publications: any[] = [];
+    vi.mocked(execCaptureStdin).mockImplementation(async (_command, _args, input) => {
+      index = JSON.parse(input);
+      index.metadata.resourceVersion = String(Number(index.metadata.resourceVersion) + 1);
+      publications.push(JSON.parse(index.data["index.json"]));
+      events.push("retention-publish");
+      return { exitCode: 0, stdout: "", stderr: "" };
+    });
+    vi.mocked(execCapture).mockImplementation(async (command, args) => {
+      const ok = (object: unknown) => ({ exitCode: 0, stdout: JSON.stringify(object), stderr: "" });
+      if (args[0] === "get" && args[1] === "configmap") {
+        if (args[2] === retentionName(RELEASE)) return ok(index);
+        for (const build of [BUILD, PREV]) {
+          if (args[2] === retentionName(RELEASE, build)) {
+            const payload = JSON.stringify(inventory(build));
+            return ok({
+              metadata: { name: args[2], labels: { "app.kubernetes.io/name": RELEASE } },
+              data: {
+                "inventory.json": payload,
+                signature: tamper ? "bad" : inventorySignature(payload, `secret-${build}`),
+              },
+            });
+          }
+        }
+      }
+      if (args[0] === "get" && args[1] === "secret") {
+        for (const build of [BUILD, PREV])
+          if (args[2] === internalSecretName(RELEASE, build))
+            return ok({ data: { secret: Buffer.from(`secret-${build}`).toString("base64") } });
+      }
+      if (
+        args[0] === "get" &&
+        args[1] === "pods" &&
+        args[args.indexOf("-l") + 1] === `app.kubernetes.io/name=${RELEASE}`
+      ) {
+        return ok({
+          items: [BUILD, PREV].map((build) => ({
+            metadata: {
+              name: `rel-ssr-${build}-pod`,
+              labels: { "app.kubernetes.io/version": build },
+            },
+            status: { conditions: [{ type: "Ready", status: "True" }] },
+            spec: { containers: [{ name: "pool-server" }] },
+          })),
+        });
+      }
+      if (args[0] === "exec" && args.includes("-e")) {
+        events.push("retention-probe");
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      if (args[0] === "patch" && args[1] === "deployment" && args[2] === `rel-ssr-${PREV}`) {
+        events.push("expiry-arm");
+      }
+      return base(command, args);
+    });
+    return { publications, before };
+  }
+
+  it("publishes and checks the index before cutover, then keeps one standby replica", async () => {
+    const { publications, before } = retainedCluster();
+    await runCutover(inputs(), deps);
+    expect(publications).toHaveLength(2);
+    expect(publications[0][PREV]).toEqual(before[PREV]);
+    expect(Object.keys(publications[0]).sort()).toEqual([BUILD, PREV].sort());
+    expect(events.indexOf("retention-probe")).toBeLessThan(events.indexOf("patch:rel-ssr"));
+    expect(events.indexOf("expiry-arm")).toBeGreaterThan(events.indexOf("retention-probe"));
+    expect(events.indexOf("expiry-arm")).toBeLessThan(events.indexOf("patch:rel-ssr"));
+    const calls = vi.mocked(execCapture).mock.calls.map(([, args]) => args.join(" "));
+    expect(calls).toContain(`scale deployment/rel-ssr-${PREV} -n ${NS} --replicas=1`);
+    expect(calls).not.toContain(`scale deployment/rel-ssr-${PREV} -n ${NS} --replicas=0`);
+    const expiry = JSON.parse(publications[1][BUILD].payload)[0].expiresAt;
+    const expiryPatches = vi
+      .mocked(execCapture)
+      .mock.calls.filter(([, args]) => args[0] === "patch" && args[2] === `rel-ssr-${PREV}`)
+      .map(([, args]) =>
+        JSON.parse(
+          JSON.parse(args.at(-1)!).metadata.annotations["adapter-k8s.io/retention-expiry"],
+        ),
+      );
+    expect(expiryPatches.map((marker) => marker.expiresAt)).toEqual([
+      JSON.parse(publications[0][BUILD].payload)[0].expiresAt,
+      expiry,
+    ]);
+    expect(expiry).toBeGreaterThan(Date.now() + 400_000);
+    expect(expiry).toBeLessThanOrEqual(Date.now() + 420_000);
+  });
+
+  it("refuses an inventory changed by a ConfigMap writer before touching selectors", async () => {
+    retainedCluster(true);
+    await expect(runCutover(inputs(), deps)).rejects.toThrow("inventory signature is invalid");
+    expect(events.filter((event) => event.startsWith("patch:"))).toEqual([]);
+    expect(deps.restoreEdgeToPreviousBuild).toHaveBeenCalled();
+    expect(execCaptureStdin).not.toHaveBeenCalled();
   });
 });

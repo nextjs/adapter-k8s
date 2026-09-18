@@ -110,6 +110,29 @@ afterEach(() => {
 });
 
 describe("local handler loopback reuse", () => {
+  it("survives reuse at the loopback server's idle timeout without replaying the handler", async () => {
+    const handler = vi.fn((_req: IncomingMessage, res: ServerResponse) => res.end("ok"));
+    const invoke = () => {
+      const res = mockRes();
+      return invokeLocalHandlerOverHttp({
+        handler: handler as never,
+        req: mockReq("/idle-reuse"),
+        res,
+        matchedPathname: "/idle-reuse",
+        routeMatches: null,
+        bufferedBody: undefined,
+      }).then(() => res);
+    };
+
+    await invoke();
+    // Let the default 5s keep-alive timeout (+1s buffer in newer Node) become due without
+    // processing its socket close. Reusing the socket now reproduces the live six-second
+    // probe gap: the server's due timer races the next request and resets the connection.
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 6_100);
+    expect((await invoke())._body).toBe("ok");
+    expect(handler).toHaveBeenCalledTimes(2);
+  }, 10_000);
+
   it("reuses one process-level listener and connection for bodyless reads", async () => {
     const listenerPorts: number[] = [];
     const peerPorts: number[] = [];

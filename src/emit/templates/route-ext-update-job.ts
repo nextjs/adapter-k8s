@@ -108,6 +108,27 @@ ${pullSecretsBlock}      # This Job uses the same immutable multi-platform image
               set -e
               NEG="${releaseName}-routing-neg"
               BS="${releaseName}-routing-service"
+              # Reconcile existing installations too: init skips already-created resources.
+              # Keep the legacy TCP check until destroy; never delete an attached check.
+              HC="${releaseName}-routing-ready-hc"
+              if ! HC_STATE=$(gcloud compute health-checks describe "$HC" --global --project=${projectId} \
+                --format='csv[no-heading](type,httpHealthCheck.port,httpHealthCheck.requestPath,checkIntervalSec,timeoutSec,healthyThreshold,unhealthyThreshold)'); then
+                gcloud compute health-checks create http "$HC" --global --project=${projectId} \
+                  --port=8081 --request-path=/readyz --check-interval=5s --timeout=5s \
+                  --healthy-threshold=2 --unhealthy-threshold=2 --quiet
+                HC_STATE="HTTP,8081,/readyz,5,5,2,2"
+              fi
+              if [ "$HC_STATE" != "HTTP,8081,/readyz,5,5,2,2" ]; then
+                gcloud compute health-checks update http "$HC" --global --project=${projectId} \
+                  --port=8081 --request-path=/readyz --check-interval=5s --timeout=5s \
+                  --healthy-threshold=2 --unhealthy-threshold=2 --quiet
+              fi
+              BS_STATE=$(gcloud compute backend-services describe "$BS" --global --project=${projectId} \
+                --format='csv[no-heading](healthChecks[0].basename(),connectionDraining.drainingTimeoutSec)')
+              if [ "$BS_STATE" != "$HC,60" ]; then
+                gcloud compute backend-services update "$BS" --global --project=${projectId} \
+                  --health-checks="$HC" --connection-draining-timeout=60 --quiet
+              fi
               # 1. Discover ALL forwarding rules for this gateway (HTTP *and* HTTPS). Attaching
               #    only HTTPS leaves http:// traffic bypassing ext_proc, so middleware auth /
               #    rewrites can be bypassed over http://. Wait for the GKE Gateway controller to

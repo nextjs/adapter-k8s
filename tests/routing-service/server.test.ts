@@ -5,11 +5,15 @@ import os from "node:os";
 import path from "node:path";
 import http2 from "node:http2";
 import https from "node:https";
+import { request as httpRequest } from "node:http";
+import { connect as tcpConnect } from "node:net";
+import { once as eventOnce } from "node:events";
 import { create, toBinary, fromBinary } from "@bufbuild/protobuf";
 import {
   createRoutingServer,
   createProcessHandler,
   plainResponseToProto,
+  startHealthServer,
 } from "../../src/routing-service/server.js";
 import {
   ProcessingRequestSchema,
@@ -83,6 +87,136 @@ describe("createRoutingServer", () => {
     await server.start();
     const address = server.server.address();
     expect(address).toMatchObject({ address: "127.0.0.1" });
+  });
+
+  it("keeps accepting callouts during the readiness propagation window", async () => {
+    server = createRoutingServer({ handler: continueHandler(), port: 0, host: "127.0.0.1" });
+    const { port } = await server.start();
+    let closed = false;
+    const stopped = server.stop({ delayMs: 100, graceMs: 100 }).then(() => {
+      closed = true;
+    });
+    const client = http2.connect(`http://127.0.0.1:${port}`);
+    try {
+      await eventOnce(client, "connect");
+      expect(closed).toBe(false);
+      const call = client.request({ ":path": "/" });
+      call.resume();
+      await eventOnce(call, "end");
+      expect(closed).toBe(false);
+    } finally {
+      client.destroy();
+      await stopped;
+      server = null;
+    }
+  });
+
+  it("drains an idle HTTP/2 connection so shutdown does not wait for the client to disconnect", async () => {
+    server = createRoutingServer({ handler: continueHandler(), port: 0, host: "127.0.0.1" });
+    const { port } = await server.start();
+    const accepted = eventOnce(server.server, "session");
+    const client = http2.connect(`http://127.0.0.1:${port}`);
+    await accepted;
+    const goaway = vi.fn();
+    client.on("goaway", goaway);
+    const stopped = server.stop();
+    try {
+      await expect(
+        Promise.race([
+          stopped.then(() => "stopped"),
+          new Promise((resolve) => setTimeout(() => resolve("still waiting for client"), 200)),
+        ]),
+      ).resolves.toBe("stopped");
+      expect(goaway).toHaveBeenCalled();
+    } finally {
+      client.destroy();
+      await stopped;
+      server = null;
+    }
+  });
+
+  it("bounds shutdown even when a peer never completes its HTTP/2 handshake", async () => {
+    server = createRoutingServer({ handler: continueHandler(), port: 0, host: "127.0.0.1" });
+    const { port } = await server.start();
+    const accepted = eventOnce(server.server, "connection");
+    const client = tcpConnect(port, "127.0.0.1");
+    await accepted;
+    try {
+      await expect(
+        Promise.race([
+          server.stop({ graceMs: 30 }).then(() => "stopped"),
+          new Promise((resolve) => setTimeout(() => resolve("unbounded"), 300)),
+        ]),
+      ).resolves.toBe("stopped");
+    } finally {
+      client.destroy();
+    }
+  });
+
+  it("tells the caller to reconnect while allowing an in-flight middleware verdict to finish", async () => {
+    let entered!: () => void;
+    let finish!: () => void;
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const pending = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    server = createRoutingServer({
+      port: 0,
+      host: "127.0.0.1",
+      failOpen: false,
+      handler: async () => {
+        entered();
+        await pending;
+        return { immediateResponse: { status: { code: 403 }, body: "denied during drain" } };
+      },
+    });
+    const { port } = await server.start();
+    const client = http2.connect(`http://127.0.0.1:${port}`);
+    const call = client.request({
+      ":method": "POST",
+      ":path": "/envoy.service.ext_proc.v3.ExternalProcessor/Process",
+      "content-type": "application/grpc",
+      te: "trailers",
+    });
+    const payload = Buffer.from(
+      toBinary(ProcessingRequestSchema, makeRequestHeadersCallout("/protected")),
+    );
+    const frame = Buffer.alloc(5 + payload.length);
+    frame.writeUInt32BE(payload.length, 1);
+    payload.copy(frame, 5);
+    const chunks: Buffer[] = [];
+    call.on("data", (chunk) => chunks.push(chunk));
+    const ended = eventOnce(call, "end");
+    call.end(frame);
+    await started;
+    const goaway = eventOnce(client, "goaway");
+    const stopped = server.stop();
+    try {
+      await expect(
+        Promise.race([
+          goaway.then(() => "draining"),
+          new Promise((resolve) => setTimeout(() => resolve("no drain notice"), 200)),
+        ]),
+      ).resolves.toBe("draining");
+      finish();
+      await ended;
+      const body = Buffer.concat(chunks);
+      const verdict = fromBinary(
+        ProcessingResponseSchema,
+        body.subarray(5, 5 + body.readUInt32BE(1)),
+      );
+      expect(verdict.response.case).toBe("immediateResponse");
+      if (verdict.response.case === "immediateResponse")
+        expect(verdict.response.value.status?.code).toBe(403);
+      await stopped;
+    } finally {
+      finish();
+      client.destroy();
+      await stopped;
+      server = null;
+    }
   });
 
   it("keeps the plaintext h2c path working for emulate (no TLS env)", async () => {
@@ -164,6 +298,44 @@ describe("createRoutingServer", () => {
     });
     expect(http1Status).toBe(403);
     for (const socket of sockets) socket.destroy();
+  });
+});
+
+describe("routing readiness withdrawal", () => {
+  it("only accepts drain from loopback and keeps liveness healthy while readiness is withdrawn", async () => {
+    let ready = true;
+    const health = await startHealthServer(
+      0,
+      () => ready,
+      "127.0.0.1",
+      () => {
+        ready = false;
+      },
+    );
+    const probe = (path: string, method = "GET", localAddress = "127.0.0.1") =>
+      new Promise<number>((resolve, reject) => {
+        const req = httpRequest(
+          { host: "127.0.0.1", port: health.port, path, method, localAddress, agent: false },
+          (res) => {
+            res.resume();
+            res.on("end", () => resolve(res.statusCode!));
+          },
+        );
+        req.on("error", reject);
+        req.end();
+      });
+    try {
+      expect(await probe("/readyz")).toBe(200);
+      expect(await probe("/drain", "POST", "127.0.0.2")).toBe(403);
+      expect(await probe("/readyz")).toBe(200);
+      expect(await probe("/drain", "POST")).toBe(200);
+      expect(await probe("/readyz")).toBe(503);
+      expect(await probe("/healthz")).toBe(200);
+      expect(await probe("/drain", "POST")).toBe(200);
+      expect(await probe("/readyz")).toBe(503);
+    } finally {
+      await health.close();
+    }
   });
 });
 

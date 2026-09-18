@@ -14,6 +14,7 @@ import { outputDirName } from "./infrastructure-validation.js";
 import { execCapture, execOrThrow } from "./exec.js";
 import { sanitizeForTerminal } from "./terminal.js";
 import { resolveContainerCli, CONTAINER_CLI_CANDIDATES } from "./container-runtime.js";
+import { COMPRESSION_ENVOY_IMAGE } from "../emit/envoy-compression.js";
 
 const DIM = "\x1b[2m";
 const BOLD = "\x1b[1m";
@@ -24,10 +25,8 @@ const CYAN = "\x1b[36m";
 const RESET = "\x1b[0m";
 
 export const EMULATE_LISTEN_HOST = "127.0.0.1";
-// Multi-platform index digests resolved from the prior Envoy v1.32-latest and Valkey 8 tags on
-// 2026-08-26. Keep the readable version in this comment when refreshing the reviewed digests.
-export const EMULATE_ENVOY_IMAGE =
-  "envoyproxy/envoy@sha256:6bf0d37dd5e8eac4b37effe89a1aec4760f7f2ce860d1fd6af22147eb87a5058";
+export const EMULATE_ENVOY_IMAGE = COMPRESSION_ENVOY_IMAGE;
+// Multi-platform Valkey 8 index digest resolved on 2026-08-26.
 export const EMULATE_VALKEY_IMAGE =
   "valkey/valkey@sha256:f0ba225266310efba5fb33383e21c64fbd07907304224786c780606e7ebd7327";
 
@@ -59,8 +58,12 @@ export function assertEmulateNodeVersion(version = process.versions.node): void 
  * symlink and have the operator's own run write Envoy YAML through it into any file the operator
  * can write. mkdtemp creates a private (0700) directory that cannot already exist.
  */
-export function renderEnvoyConfigForPort(envoyYamlSource: string, port: number): string {
-  if (!existsSync(envoyYamlSource) || port === 8080) return envoyYamlSource;
+export function renderEnvoyConfigForPort(
+  envoyYamlSource: string,
+  port: number,
+  compression = true,
+): string {
+  if (!existsSync(envoyYamlSource) || (port === 8080 && compression)) return envoyYamlSource;
   const source = readFileSync(envoyYamlSource, "utf-8");
   const matches = source.match(/port_value: 8080\b/g) ?? [];
   if (matches.length !== 1) {
@@ -72,7 +75,16 @@ export function renderEnvoyConfigForPort(envoyYamlSource: string, port: number):
   }
   const dir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-envoy-"));
   const rendered = path.join(dir, "envoy.yaml");
-  writeFileSync(rendered, source.replace(/port_value: 8080\b/, `port_value: ${port}`));
+  const configured = source.replace(/port_value: 8080\b/, `port_value: ${port}`);
+  writeFileSync(
+    rendered,
+    compression
+      ? configured
+      : configured
+          .split("\n")
+          .filter((line) => !line.trim().startsWith('- {"name":"envoy.filters.http.compressor.'))
+          .join("\n"),
+  );
   return rendered;
 }
 
@@ -140,11 +152,13 @@ ${DIM}Local Envoy → routing service → pool request path${RESET}
   const buildMetaPath = path.join(outputDir, "build-metadata.json");
   let buildId = "local";
   let cacheEnabled = false;
+  let compressionEnabled = true;
   if (existsSync(buildMetaPath)) {
     try {
       const meta = JSON.parse(readFileSync(buildMetaPath, "utf-8"));
       buildId = meta.buildId;
       cacheEnabled = meta.cacheEnabled === true;
+      compressionEnabled = meta.compressionEnabled !== false;
     } catch (err) {
       // Name the file — a bare SyntaxError gives no clue WHICH file is corrupt.
       throw new Error(`Failed to parse ${buildMetaPath}: ${(err as Error).message}`);
@@ -339,7 +353,7 @@ ${DIM}Local Envoy → routing service → pool request path${RESET}
   // --- 5. Start Envoy ---
   const envoyYamlSource = resolveEmulateEnvoyConfig(distDir);
 
-  const envoyYaml = renderEnvoyConfigForPort(envoyYamlSource, port);
+  const envoyYaml = renderEnvoyConfigForPort(envoyYamlSource, port, compressionEnabled);
 
   let envoyChild: ChildProcess | null = null;
 

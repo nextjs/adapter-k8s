@@ -916,7 +916,7 @@ function parseDiagnostic(value: unknown, path: string): DiagnosticSource {
         kind,
         projectId: projectId(),
         name: safeText(parsed.name, `${path}.name`, 63),
-        expectedType: literal(parsed.expectedType, "TCP", `${path}.expectedType`),
+        expectedType: oneOf(parsed.expectedType, ["TCP", "HTTP"] as const, `${path}.expectedType`),
       };
     case "gcp-certificate":
       exactKeys(parsed, ["kind", "projectId", "name"], path);

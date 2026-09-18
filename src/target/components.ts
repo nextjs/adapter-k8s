@@ -64,6 +64,18 @@ function copyHosts(hosts: readonly HostConfig[]): HostConfig[] {
   });
 }
 
+function validateRequestTimeout(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  // Gateway API Duration format. Compare the full match to reject a trailing newline too.
+  const duration = /^(?:[0-9]{1,5}(?:ms|h|m|s)){1,4}$/;
+  if (typeof value !== "string" || duration.exec(value)?.[0] !== value) {
+    throw new Error(
+      `requestTimeout must be a Gateway API duration such as "30s" or "0s", got ${JSON.stringify(value)}`,
+    );
+  }
+  return value;
+}
+
 function copyIngressSources(sources?: IngressSourceSet): IngressSourceSet {
   return sources ? normalizeIngressSources(sources) : { cidrs: [], podSelectors: [] };
 }
@@ -520,6 +532,8 @@ function certManagerContribution(
 export interface GatewayApiExposureOptions {
   className: string;
   hosts: readonly HostConfig[];
+  /** Whole-response Gateway API timeout, e.g. "30s". "0s" requests no deadline; omitted uses the controller default. */
+  requestTimeout?: string;
   tlsSecretName?: string;
   /**
    * Emit a cert-manager Certificate for the HTTPS listener's Secret. `tlsSecretName`
@@ -539,6 +553,7 @@ export interface GatewayApiExposureOptions {
 
 export function gatewayApiExposure(options: GatewayApiExposureOptions): ExposureComponent {
   const hosts = copyHosts(options.hosts);
+  const requestTimeout = validateRequestTimeout(options.requestTimeout);
   assertSafeKubernetesObjectName(options.className, "GatewayClass name");
   const ingressSources = requireExternalIngressSources(
     "gatewayApiExposure",
@@ -674,6 +689,7 @@ export function gatewayApiExposure(options: GatewayApiExposureOptions): Exposure
             rules: [
               {
                 matches: [{ path: { type: "PathPrefix", value: "/" } }],
+                ...(requestTimeout !== undefined ? { timeouts: { request: requestTimeout } } : {}),
                 backendRefs: [
                   { name: context.origin.service.name, port: context.origin.service.port },
                 ],
@@ -825,6 +841,8 @@ export interface HttpRouteExposureOptions {
     sectionName?: string;
   }>;
   hosts: readonly HostConfig[];
+  /** Whole-response Gateway API timeout, e.g. "30s". "0s" requests no deadline; omitted uses the controller default. */
+  requestTimeout?: string;
   /**
    * Escaped-slash parity (escapedSlashesAction: KeepUnchanged) is the GATEWAY OWNER's
    * job on a shared gateway — ClientTrafficPolicy is Gateway-scoped and namespace-local.
@@ -858,6 +876,7 @@ const SECTION_NAME_RE = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/;
  */
 export function httpRouteExposure(options: HttpRouteExposureOptions): ExposureComponent {
   const hosts = copyHosts(options.hosts);
+  const requestTimeout = validateRequestTimeout(options.requestTimeout);
   assertSafeKubernetesObjectName(options.className, "GatewayClass name");
   const ingressSources = requireExternalIngressSources("httpRouteExposure", options.ingressSources);
   const configuredAnnotations = copyAnnotations(
@@ -916,6 +935,7 @@ export function httpRouteExposure(options: HttpRouteExposureOptions): ExposureCo
             rules: [
               {
                 matches: [{ path: { type: "PathPrefix", value: "/" } }],
+                ...(requestTimeout !== undefined ? { timeouts: { request: requestTimeout } } : {}),
                 backendRefs: [
                   { name: context.origin.service.name, port: context.origin.service.port },
                 ],
@@ -1393,6 +1413,12 @@ export function gkeNativeRouting(
             name: `${context.releaseName}-routing-hc`,
             scope: "global",
           },
+          {
+            kind: "gcp-health-check",
+            projectId,
+            name: `${context.releaseName}-routing-ready-hc`,
+            scope: "global",
+          },
           { kind: "gcp-global-address", projectId, name: addressName },
         ],
         diagnostics: [
@@ -1413,8 +1439,8 @@ export function gkeNativeRouting(
           {
             kind: "gcp-health-check-shape",
             projectId,
-            name: `${context.releaseName}-routing-hc`,
-            expectedType: "TCP",
+            name: `${context.releaseName}-routing-ready-hc`,
+            expectedType: "HTTP",
           },
         ],
       };

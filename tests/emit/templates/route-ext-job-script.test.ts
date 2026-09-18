@@ -144,3 +144,89 @@ describe("route-extension registration snapshot", () => {
     expect(result.imported).not.toContain('celExpression: "false"');
   });
 });
+
+it.each([
+  {
+    scenario: "unchanged",
+    health: "HTTP,8081,/readyz,5,5,2,2",
+    backend: "my-app-routing-ready-hc,60",
+    mutations: [],
+  },
+  {
+    scenario: "legacy TCP backend",
+    health: "missing",
+    backend: "my-app-routing-hc,0",
+    mutations: ["health-checks create", "backend-services update"],
+  },
+  {
+    scenario: "configuration drift",
+    health: "HTTP,8081,/healthz,10,5,2,2",
+    backend: "my-app-routing-ready-hc,0",
+    mutations: ["health-checks update", "backend-services update"],
+  },
+  {
+    scenario: "permission denied",
+    health: "denied",
+    backend: "my-app-routing-hc,0",
+    mutations: ["health-checks create"],
+  },
+])("reconciles routing drain configuration: $scenario", ({ health, backend, mutations }) => {
+  const dir = mkdtempSync(path.join(tmpdir(), "routing-drain-config-"));
+  try {
+    const log = path.join(dir, "calls.jsonl");
+    writeFileSync(
+      path.join(dir, "gcloud"),
+      `#!/usr/bin/env node
+const args = process.argv.slice(2);
+require('node:fs').appendFileSync(process.env.CALL_LOG, JSON.stringify(args) + '\\n');
+if (args[1] === 'health-checks') {
+  if (process.env.HEALTH_STATE === 'denied') process.exit(1);
+  if (args[2] === 'describe') {
+    if (process.env.HEALTH_STATE === 'missing') process.exit(1);
+    console.log(process.env.HEALTH_STATE);
+  }
+}
+if (args[1] === 'backend-services' && args[2] === 'describe') console.log(process.env.BACKEND_STATE);
+`,
+      { mode: 0o700 },
+    );
+    const job = renderRouteExtUpdateJob({
+      releaseName: "my-app",
+      projectId: "p-123456",
+      buildId: "drain",
+    });
+    const script = job
+      .slice(job.indexOf("              set -e"), job.indexOf("              # 1. Discover"))
+      .replace(/^ {14}/gm, "");
+    const result = spawnSync("/bin/sh", ["-c", script], {
+      encoding: "utf8",
+      timeout: 5000,
+      env: {
+        PATH: dir + path.delimiter + process.env.PATH,
+        CALL_LOG: log,
+        HEALTH_STATE: health,
+        BACKEND_STATE: backend,
+      },
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(health === "denied" ? 1 : 0);
+    const calls = readFileSync(log, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    expect(
+      calls.filter((args) => args[2] !== "describe").map((args) => `${args[1]} ${args[2]}`),
+    ).toEqual(mutations);
+    expect(calls.some((args) => args[1] === "backend-services")).toBe(health !== "denied");
+    const backendUpdate = calls.find(
+      (args) => args[1] === "backend-services" && args[2] === "update",
+    );
+    if (backendUpdate) {
+      expect(backendUpdate).toContain("--health-checks=my-app-routing-ready-hc");
+      expect(backendUpdate).toContain("--connection-draining-timeout=60");
+    }
+    expect(calls.some((args) => args[2] === "delete")).toBe(false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

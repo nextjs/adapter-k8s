@@ -1,4 +1,10 @@
-import { createServer, createSecureServer, type Http2Server } from "node:http2";
+import {
+  createServer,
+  createSecureServer,
+  type Http2Server,
+  type ServerHttp2Session,
+} from "node:http2";
+import type { Socket } from "node:net";
 import { createServer as createHttpServer } from "node:http";
 import { readFileSync, existsSync } from "node:fs";
 import { create } from "@bufbuild/protobuf";
@@ -350,14 +356,30 @@ export function createProcessHandler(
 // at the socket layer even when the event loop is wedged; an httpGet probe must be
 // *processed* by the loop, so a blocked/broken service fails it and gets evicted —
 // which is the failure the ext_proc callout would otherwise hit silently.
-export function startHealthServer(
+export async function startHealthServer(
   port: number,
   isReady: () => boolean,
   host = "0.0.0.0",
-): HealthServer {
+  onDrain?: () => void,
+): Promise<HealthServer> {
   const srv = createHttpServer((req, res) => {
+    if (req.url === "/drain" && req.method === "POST" && onDrain) {
+      // Only the in-container preStop hook may withdraw readiness. Never trust
+      // forwarded headers: the same port is reachable by external health probes.
+      const peer = req.socket.remoteAddress;
+      if (peer !== "127.0.0.1" && peer !== "::1" && peer !== "::ffff:127.0.0.1") {
+        res.writeHead(403);
+        res.end();
+        return;
+      }
+      req.resume();
+      onDrain();
+      res.writeHead(200);
+      res.end("draining");
+      return;
+    }
     if (req.url === "/healthz" || req.url === "/readyz") {
-      const ready = isReady();
+      const ready = req.url !== "/readyz" || isReady();
       res.writeHead(ready ? 200 : 503, { "content-type": "text/plain" });
       res.end(ready ? "ok" : "not-ready");
     } else {
@@ -365,10 +387,17 @@ export function startHealthServer(
       res.end();
     }
   });
-  srv.listen(port, host, () => console.log(`Routing health server on port ${port}`));
-  return { close: () => new Promise<void>((r) => srv.close(() => r())) };
+  await new Promise<void>((resolve, reject) => {
+    srv.once("error", reject);
+    srv.listen(port, host, resolve);
+  });
+  const address = srv.address();
+  const boundPort = typeof address === "object" && address ? address.port : port;
+  console.log(`Routing health server on port ${boundPort}`);
+  return { port: boundPort, close: () => new Promise<void>((r) => srv.close(() => r())) };
 }
 interface HealthServer {
+  port: number;
   close(): Promise<void>;
 }
 
@@ -404,6 +433,21 @@ export function createRoutingServer(options: RoutingServerOptions) {
     : createServer(nodeHandler);
   console.log(`Routing service transport: ${useTls ? "TLS (h2)" : "plaintext (h2c)"}`);
 
+  const sessions = new Set<ServerHttp2Session>();
+  const sockets = new Set<Socket>();
+  let closing = false;
+  let stopped: Promise<void> | undefined;
+  server.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+  });
+  server.on("session", (session) => {
+    sessions.add(session);
+    session.once("close", () => sessions.delete(session));
+    // A TLS handshake accepted before listener closure can finish after it.
+    if (closing) session.close();
+  });
+
   return {
     start(): Promise<{ port: number }> {
       return new Promise((resolve, reject) => {
@@ -417,10 +461,36 @@ export function createRoutingServer(options: RoutingServerOptions) {
       });
     },
 
-    stop(): Promise<void> {
-      return new Promise((resolve, reject) => {
-        server.close((err) => (err ? reject(err) : resolve()));
+    stop({ delayMs = 0, graceMs = 30_000 } = {}): Promise<void> {
+      if (stopped) return stopped;
+      for (const [name, value] of Object.entries({ delayMs, graceMs })) {
+        if (!Number.isSafeInteger(value) || value < 0 || value > 600_000)
+          throw new Error(`Invalid routing shutdown ${name}`);
+      }
+      stopped = new Promise((resolve, reject) => {
+        const close = () => {
+          closing = true;
+          const deadline = setTimeout(() => {
+            console.warn(`Routing drain deadline: closing ${sockets.size} remaining connections`);
+            for (const session of sessions) session.destroy();
+            // Also bound incomplete TLS/HTTP2 handshakes that never produced a session.
+            for (const socket of sockets) socket.destroy();
+          }, graceMs);
+          server.close((err) => {
+            clearTimeout(deadline);
+            if (err) reject(err);
+            else resolve();
+          });
+          // Recent Node 24 versions do this inside server.close(); keep the contract
+          // explicit for older supported runtimes. Accepted middleware calls finish.
+          for (const session of sessions) session.close();
+        };
+        // Readiness is withdrawn by the lifecycle before calling stop. Keep the
+        // listener AND sessions usable while the load balancer removes the endpoint.
+        if (delayMs) setTimeout(close, delayMs);
+        else close();
       });
+      return stopped;
     },
 
     get server() {

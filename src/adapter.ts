@@ -1,3 +1,4 @@
+import { renderRetentionInventory } from "./emit/templates/retention.js";
 // src/adapter.ts
 import {
   writeFile,
@@ -1073,7 +1074,12 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       };
       const modified: MutableNextConfig = {
         ...nextConfig,
+        // Response compression belongs in the proxy, outside the Node runtime.
+        // Override the app's value through the deployment adapter hook too.
         compress: false,
+        ...(cfg.retention?.enabled && !nextConfig.deploymentId
+          ? { deploymentId: `b${Date.now().toString(36)}${randomBytes(6).toString("hex")}` }
+          : {}),
         // Set turbopack root to the project directory to avoid workspace detection issues
         // when the adapter is loaded from outside the project tree (e.g., e2e tests)
         turbopack: {
@@ -1699,9 +1705,13 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             releaseName,
             namespace,
             projectId: registrationProjectId!,
+            // Only the defaults reserve transport headroom. Preserve operator-selected
+            // callout timeouts and the existing derivation for explicit handler budgets.
             timeout: gkeProvider?.serviceExtensions?.routeExtension?.timeout
               ? `${gkeProvider.serviceExtensions.routeExtension.timeout}s`
-              : `${Math.max(1, Math.ceil((cfg.routingService?.requestTimeoutMs ?? 4000) / 1000))}s`,
+              : cfg.routingService?.requestTimeoutMs === undefined
+                ? "5s" // Leave transport time beyond the default 4000ms handler budget.
+                : `${Math.max(1, Math.ceil(cfg.routingService.requestTimeoutMs / 1000))}s`,
             failureModeAllow,
           })
         : undefined;
@@ -1743,6 +1753,43 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         // Deployments reference the mutable build-id tag with `imagePullPolicy: Always`,
         // which is the mitigation for a retag.
       });
+
+      if (cfg.retention?.enabled) {
+        const referencesPath = path.join(distDir, "server/server-reference-manifest.json");
+        const references = existsSync(referencesPath)
+          ? JSON.parse(readFileSync(referencesPath, "utf8"))
+          : {};
+        const inventory = {
+          buildId,
+          deploymentId: deploymentId ?? "",
+          defaultPool: configuredDefaultPool,
+          pools: [...pools.keys()],
+          gracePeriodSeconds: cfg.retention.gracePeriodSeconds ?? 300,
+          responseHeadTimeoutMs: Math.max(
+            60_000,
+            ...Object.values(routingManifest.poolResponseHeadTimeouts ?? {}),
+          ),
+          assets: staticManifest
+            .filter((a) => !a.prerender && a.pathname.includes("/_next/static/immutable/"))
+            .map((a) => a.pathname),
+          actions: [
+            ...new Set([
+              ...Object.keys(references.node ?? {}),
+              ...Object.keys(references.edge ?? {}),
+            ]),
+          ],
+        };
+        helmFiles["templates/retained-build-inventory.yaml"] = renderRetentionInventory(
+          releaseName,
+          inventory,
+          await deriveInternalSecret(projectDir, releaseName, buildId),
+        );
+        await writeOutputFile(
+          projectDir,
+          "retained-build-inventory.json",
+          JSON.stringify(inventory),
+        );
+      }
 
       if (compiledTarget) {
         await writeOutputFile(
@@ -2104,6 +2151,14 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           readAdapterBundle("pool-server.cjs"),
           absSharedStageDir,
         );
+        if (cfg.retention?.enabled) {
+          await writeOutputFile(
+            projectDir,
+            "retention-cleanup.cjs",
+            readAdapterBundle("retention-cleanup.cjs"),
+            absSharedStageDir,
+          );
+        }
 
         await writeOutputFile(
           projectDir,
@@ -2117,6 +2172,14 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           JSON.stringify(staticManifest, null, 2),
           absSharedStageDir,
         );
+        if (cfg.middleCache?.enabled) {
+          await writeOutputFile(
+            projectDir,
+            "config/middle-cache.go",
+            readAdapterBundle("middle-cache.go"),
+            absSharedStageDir,
+          );
+        }
 
         for (const [poolName, pool] of pools) {
           await writeOutputFile(
@@ -2133,6 +2196,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           // Base image version comes from DEFAULT_EMITTED_NODE_VERSION (dockerfiles.ts). Node 24
           // is required by the manifest's scoped regexp compatibility modifiers.
           generateDockerfile({
+            middleCache: cfg.middleCache?.enabled === true,
             containerStrategy: "shared-image",
             buildId,
             targetPlatform: imageTargetPlatform,
@@ -2269,6 +2333,14 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             readAdapterBundle("pool-server.cjs"),
             poolStageDir,
           );
+          if (cfg.retention?.enabled) {
+            await writeOutputFile(
+              projectDir,
+              "retention-cleanup.cjs",
+              readAdapterBundle("retention-cleanup.cjs"),
+              poolStageDir,
+            );
+          }
 
           await writeOutputFile(
             projectDir,
@@ -2288,11 +2360,20 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             JSON.stringify(staticManifest, null, 2),
             poolStageDir,
           );
+          if (cfg.middleCache?.enabled) {
+            await writeOutputFile(
+              projectDir,
+              "config/middle-cache.go",
+              readAdapterBundle("middle-cache.go"),
+              poolStageDir,
+            );
+          }
 
           await writeOutputFile(
             projectDir,
             `Dockerfile`,
             generatePoolDockerfile({
+              middleCache: cfg.middleCache?.enabled === true,
               poolName,
               buildId,
               targetPlatform: imageTargetPlatform,
@@ -2344,6 +2425,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
               projectDir,
               "Dockerfile",
               generatePoolBaseDockerfile({
+                middleCache: cfg.middleCache?.enabled === true,
                 buildId,
                 targetPlatform: imageTargetPlatform,
                 ...(installSharpVersion ? { installSharpVersion } : {}),
@@ -2686,6 +2768,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           hasMiddleware: !!outputs.middleware,
           failureModeAllow,
           cacheEnabled: cfg.cache?.enabled ?? false,
+          compressionEnabled: cfg.compression?.enabled !== false,
           cacheManaged: compiledTarget
             ? compiledTarget.plan.operations.cache.kind === "gcp-memorystore"
             : !!cfg.cache?.enabled && !cfg.cache.url,
