@@ -186,6 +186,15 @@ The specific behaviors the architecture exists to get right, each confirmed agai
   checks in both cutover directions. The baseline without retention remains red.
   This comparison switches a loopback proxy
   between production builds; it does not verify Kubernetes, Envoy, or CDN behavior.
+- **Previous-build retention on live GKE.** A three-build run on September 17, 2026
+  exercised promotion, rollback, and superseded-build cleanup with middleware, the middle
+  cache, Envoy compression, and Cloud CDN enabled. All 61,824 continuous public probes
+  succeeded. Old tabs loaded cold chunks and ran actions once; middleware denied retained
+  requests; both shared and changed action IDs reached the correct build. After expiry,
+  an old chunk and an unknown action ID returned 404 without mutation replay. The final
+  fixture passed all 30 live checks and all 33 doctor checks. The load-balancer error
+  query returned no 5xx entries. This covers one pool and successful cloud operations;
+  standby capacity remained one replica after expiry, as documented.
 - **Full-topology runs are operator-initiated, not per-commit CI.** The cluster-topology
   suite (layer 2) covers the ext_proc path end to end, but it runs on a local k3d cluster
   when a maintainer launches it—hours, not minutes. Pull requests are gated by the unit,
