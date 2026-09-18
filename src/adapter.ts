@@ -1705,9 +1705,13 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             releaseName,
             namespace,
             projectId: registrationProjectId!,
+            // Only the defaults reserve transport headroom. Preserve operator-selected
+            // callout timeouts and the existing derivation for explicit handler budgets.
             timeout: gkeProvider?.serviceExtensions?.routeExtension?.timeout
               ? `${gkeProvider.serviceExtensions.routeExtension.timeout}s`
-              : `${Math.max(1, Math.ceil((cfg.routingService?.requestTimeoutMs ?? 4000) / 1000))}s`,
+              : cfg.routingService?.requestTimeoutMs === undefined
+                ? "5s" // Leave transport time beyond the default 4000ms handler budget.
+                : `${Math.max(1, Math.ceil(cfg.routingService.requestTimeoutMs / 1000))}s`,
             failureModeAllow,
           })
         : undefined;
