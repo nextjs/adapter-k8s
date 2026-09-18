@@ -3,7 +3,7 @@
 // reachable via K8S_VALIDATE_CONTEXT.
 import { describe, it, expect } from "vitest";
 import { execFileSync } from "node:child_process";
-import { writeFileSync, mkdtempSync } from "node:fs";
+import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { renderGenericGateway } from "../../../src/emit/templates/generic-gateway.js";
@@ -16,13 +16,17 @@ const ctx = process.env.K8S_VALIDATE_CONTEXT;
 describe.skipIf(!ctx)("generic templates validate against a real API server", () => {
   const apply = (yaml: string) => {
     const dir = mkdtempSync(path.join(tmpdir(), "gwcheck-"));
-    const f = path.join(dir, "doc.yaml");
-    writeFileSync(f, yaml);
-    return execFileSync(
-      "kubectl",
-      ["--context", ctx!, "apply", "--dry-run=server", "-n", "default", "-f", f],
-      { encoding: "utf8", stdio: "pipe" },
-    );
+    try {
+      const f = path.join(dir, "doc.yaml");
+      writeFileSync(f, yaml);
+      return execFileSync(
+        "kubectl",
+        ["--context", ctx!, "apply", "--dry-run=server", "-n", "default", "-f", f],
+        { encoding: "utf8", stdio: "pipe" },
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   };
 
   it("Gateway is accepted by the API server", () => {
