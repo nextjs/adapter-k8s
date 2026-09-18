@@ -156,7 +156,17 @@ function writeStagedDir(): { dir: string; configDir: string } {
       nextVersion: "16.3.3",
     }),
   );
-  writeFileSync(path.join(dir, "mw.mjs"), "export function proxy(request) {}\n");
+  writeFileSync(
+    path.join(dir, "mw.mjs"),
+    `export function proxy(request) {
+    if (new URL(request.url).pathname === "/mw-scheme") {
+      const protocol = new URL(request.url).protocol;
+      return new Response(protocol, { headers: {
+        "set-cookie": protocol === "https:" ? "production-session=1; Secure; Path=/" : "development-session=1; Path=/"
+      } });
+    }
+  }\n`,
+  );
   // Static-assets manifest as the adapter now emits it: public/ files included with
   // the mutable default. stale.txt is deliberately missing.
   writeFileSync(
@@ -254,6 +264,22 @@ describe("pool-server response cache-control precedence", () => {
     prune("SIGTERM", listenersBefore.sigterm);
     prune("SIGINT", listenersBefore.sigint);
   });
+
+  it.each([
+    ["https", "https:", "production-session"],
+    ["http", "http:", "development-session"],
+    ["javascript:", "http:", "development-session"],
+  ])(
+    "middleware sees the client scheme for x-forwarded-proto=%s",
+    async (forwarded, protocol, cookie) => {
+      const res = await fetch(`http://127.0.0.1:${port}/mw-scheme`, {
+        headers: { "x-forwarded-proto": forwarded },
+      });
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe(protocol);
+      expect(res.headers.get("set-cookie")).toContain(cookie);
+    },
+  );
 
   // ---- Fix 1: public files flow through dispatch with resolved-header merging ----
 

@@ -52,6 +52,7 @@ import {
   isVerifiedPreviewRequest,
   mergeResolvedHeadersIntoHeadersArg,
   REQUEST_HEAD_TIMEOUT_MS,
+  validatedForwardedProtocol,
 } from "./dispatch.js";
 import {
   parseDispatchDeadline,
@@ -2043,6 +2044,10 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       // 400 where `next start` 308s to `/`. parseRequestUrl splices the target after a
       // VALIDATED authority, so `//…` stays a path and collapseSlashesRedirect normalizes it.
       url = parseRequestUrl(req.url ?? "/", req.headers.host);
+      // TLS terminates at ingress. Middleware must see the public scheme too:
+      // an http URL here makes auth middleware write development session cookies
+      // while Node handlers correctly look for the HTTPS cookie names.
+      url.protocol = `${validatedForwardedProtocol(req) ?? "http"}:`;
     } catch {
       // A malformed Host header (or absolute-form request-target) must not become a
       // 500 — it's the client's own protocol error.
