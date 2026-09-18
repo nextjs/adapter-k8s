@@ -38,6 +38,7 @@ export function renderValuesYaml({
   config,
   imageRegistry,
   defaultPool = pools.keys().next().value,
+  nativePoolRoutingSupported = false,
 }: {
   pools: Map<string, PoolDefinition>;
   buildId: string;
@@ -46,6 +47,7 @@ export function renderValuesYaml({
   config: K8sAdapterConfig;
   imageRegistry: string;
   defaultPool?: string;
+  nativePoolRoutingSupported?: boolean;
 }): string {
   // Output as JSON (valid YAML) with a comment header.
   const gke = config.provider && "gke" in config.provider ? config.provider.gke : undefined;
@@ -60,6 +62,9 @@ export function renderValuesYaml({
   if (imageRegistry !== UNCONFIGURED_IMAGE_REGISTRY) assertSafeImageRegistry(imageRegistry);
 
   const values = {
+    // Deployment optimization only. Offline/GitOps output keeps the stable origin;
+    // the CLI explicitly overwrites this after checking live predecessor endpoints.
+    ...(nativePoolRoutingSupported ? { nativePoolRouting: false } : {}),
     global: {
       // The adapter publishes one platform per build, not a multi-arch index. Constrain every
       // adapter-built workload to nodes that can execute that image; otherwise a mixed-arch

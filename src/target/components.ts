@@ -1,4 +1,8 @@
 import { createHash } from "node:crypto";
+import {
+  NATIVE_POOL_ROUTING_ANNOTATION,
+  NATIVE_POOL_ROUTING_CANDIDATE,
+} from "../emit/native-pool-routing.js";
 import type { HostConfig } from "../types.js";
 import type {
   KubernetesJsonValue,
@@ -15,6 +19,8 @@ import {
   assertSafeProjectId,
   assertSafeRegion,
   assertSafeReleaseName,
+  assertSafePoolName,
+  assertSafeServiceName,
   assertSafeSecretName,
   sanitizeK8sName,
 } from "../emit/templates/utils.js";
@@ -128,6 +134,43 @@ function origin(context: TargetBuildContext): {
       port: 3000,
     },
   };
+}
+
+function gatewayApplicationRules(
+  context: ExposureBuildContext,
+  requestTimeout?: string,
+): KubernetesJsonValue[] {
+  assertSafeReleaseName(context.releaseName);
+  assertSafeServiceName(context.origin.service.name);
+  // HTTPRoute admits at most 16 rules. The origin already targets the default pool;
+  // reserve its fallback and use the other slots for foreign pools deterministically.
+  // Overflow pools still resolve correctly through the origin's authenticated proxy.
+  const pools = context.origin.poolHeaderRouting
+    ? [...context.pools]
+        .filter((pool) => pool !== context.defaultPool)
+        .sort()
+        .slice(0, 15)
+    : [];
+  return [
+    ...pools.map((pool) => {
+      assertSafePoolName(pool);
+      return {
+        matches: [
+          {
+            path: { type: "PathPrefix", value: "/" },
+            headers: [{ type: "Exact", name: "x-upstream-pool", value: pool }],
+          },
+        ],
+        ...(requestTimeout !== undefined ? { timeouts: { request: requestTimeout } } : {}),
+        backendRefs: [{ name: sanitizeK8sName(`${context.releaseName}-${pool}`), port: 3000 }],
+      };
+    }),
+    {
+      matches: [{ path: { type: "PathPrefix", value: "/" } }],
+      ...(requestTimeout !== undefined ? { timeouts: { request: requestTimeout } } : {}),
+      backendRefs: [{ name: context.origin.service.name, port: context.origin.service.port }],
+    },
+  ];
 }
 
 function gatewayCapability(
@@ -686,18 +729,15 @@ export function gatewayApiExposure(options: GatewayApiExposureOptions): Exposure
               },
             ],
             hostnames: hosts.map((host) => host.hostname),
-            rules: [
-              {
-                matches: [{ path: { type: "PathPrefix", value: "/" } }],
-                ...(requestTimeout !== undefined ? { timeouts: { request: requestTimeout } } : {}),
-                backendRefs: [
-                  { name: context.origin.service.name, port: context.origin.service.port },
-                ],
-              },
-            ],
+            rules: gatewayApplicationRules(context, requestTimeout),
           },
         },
-        { labels },
+        {
+          labels,
+          ...(context.origin.poolHeaderRouting
+            ? { annotations: { [NATIVE_POOL_ROUTING_ANNOTATION]: NATIVE_POOL_ROUTING_CANDIDATE } }
+            : {}),
+        },
       );
       const redirectRoute = wantsTls
         ? object(
@@ -932,21 +972,21 @@ export function httpRouteExposure(options: HttpRouteExposureOptions): ExposureCo
           spec: {
             parentRefs,
             hostnames: hosts.map((host) => host.hostname),
-            rules: [
-              {
-                matches: [{ path: { type: "PathPrefix", value: "/" } }],
-                ...(requestTimeout !== undefined ? { timeouts: { request: requestTimeout } } : {}),
-                backendRefs: [
-                  { name: context.origin.service.name, port: context.origin.service.port },
-                ],
-              },
-            ],
+            rules: gatewayApplicationRules(context, requestTimeout),
           },
         },
         {
           labels,
-          ...(configuredAnnotations && Object.keys(configuredAnnotations).length > 0
-            ? { annotations: configuredAnnotations }
+          ...(context.origin.poolHeaderRouting ||
+          (configuredAnnotations && Object.keys(configuredAnnotations).length > 0)
+            ? {
+                annotations: {
+                  ...configuredAnnotations,
+                  ...(context.origin.poolHeaderRouting
+                    ? { [NATIVE_POOL_ROUTING_ANNOTATION]: NATIVE_POOL_ROUTING_CANDIDATE }
+                    : {}),
+                },
+              }
             : {}),
         },
       );
@@ -1172,7 +1212,7 @@ export function envoyNativeRouting(
   return {
     componentType: "routing",
     name: "envoy-native",
-    origin,
+    origin: (context) => ({ ...origin(context), poolHeaderRouting: true }),
     build(context): RoutingBuildResult {
       const className = options.gatewayClassName ?? "eg";
       const exposure = gatewayCapability(context, "envoy-native", className);

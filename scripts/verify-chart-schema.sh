@@ -69,4 +69,4 @@ tar -xzf "${kubeconform_archive}" -C "${tool_dir}" kubeconform
 
 ADAPTER_K8S_SCHEMA_HELM="${helm_bin}" \
 ADAPTER_K8S_SCHEMA_KUBECONFORM="${tool_dir}/kubeconform" \
-  npx vitest run --disableConsoleIntercept tests/emit/chart-schema.test.ts
+  npx vitest run --disableConsoleIntercept tests/emit/chart-schema.test.ts tests/emit/native-pool-routing.test.ts

@@ -338,6 +338,53 @@ describe("Kubernetes target composition", () => {
     ).toBe(manual.plan.target.fingerprint);
   });
 
+  it.each(["dedicated", "shared"])(
+    "routes Envoy's resolved pool directly on a %s Gateway",
+    (placement) => {
+      const exposure =
+        placement === "dedicated"
+          ? gatewayApiExposure({ className: "eg", hosts })
+          : httpRouteExposure({ className: "eg", hosts, parentRefs: [{ name: "shared" }] });
+      const compiled = compileTarget(
+        defineTarget({ cluster: kubernetesCluster(), exposure, routing: envoyNativeRouting() }),
+        context({ pools: ["web", "heavy", "api"], defaultPool: "web" }),
+      );
+      const route = compiled.plan.operations.resources.objects.find(
+        (object) => object.kind === "HTTPRoute",
+      );
+      expect((route?.body.spec as any)?.rules).toEqual([
+        {
+          matches: [
+            {
+              path: { type: "PathPrefix", value: "/" },
+              headers: [{ type: "Exact", name: "x-upstream-pool", value: "api" }],
+            },
+          ],
+          backendRefs: [{ name: "test-app-api", port: 3000 }],
+        },
+        {
+          matches: [
+            {
+              path: { type: "PathPrefix", value: "/" },
+              headers: [{ type: "Exact", name: "x-upstream-pool", value: "heavy" }],
+            },
+          ],
+          backendRefs: [{ name: "test-app-heavy", port: 3000 }],
+        },
+        {
+          matches: [{ path: { type: "PathPrefix", value: "/" } }],
+          backendRefs: [{ name: "test-app-origin", port: 3000 }],
+        },
+      ]);
+      const policy = compiled.plan.operations.resources.objects.find(
+        (object) => object.kind === "EnvoyExtensionPolicy",
+      );
+      expect((policy?.body.spec as any)?.targetRefs).toEqual([
+        { group: "gateway.networking.k8s.io", kind: "HTTPRoute", name: route?.metadata.name },
+      ]);
+    },
+  );
+
   it("emits typed Gateway API objects targeting the origin Service", () => {
     const compiled = compileTarget(
       defineTarget({
@@ -352,6 +399,9 @@ describe("Kubernetes target composition", () => {
     expect(route?.apiVersion).toBe("gateway.networking.k8s.io/v1");
     expect(route?.resource).toBe("httproutes");
     expect(JSON.stringify(route?.body)).toContain('"name":"test-app-origin"');
+    expect((route!.body.spec as any).rules).toHaveLength(1);
+    expect((route!.body.spec as any).rules[0].timeouts).toBeUndefined();
+    expect(JSON.stringify(route?.body)).not.toContain("x-upstream-pool");
     expect(compiled.plan.requirements.kubernetes.resources).toContainEqual({
       apiVersion: "gateway.networking.k8s.io/v1",
       resource: "gateways",
@@ -378,6 +428,49 @@ describe("Kubernetes target composition", () => {
         timeoutSeconds: 600,
       })),
     );
+  });
+
+  it("bounds native pool rules and leaves overflow pools on the origin fallback", () => {
+    const pools = Array.from({ length: 20 }, (_, index) => `p${String(index).padStart(2, "0")}`);
+    const target = defineTarget({
+      cluster: kubernetesCluster(),
+      exposure: gatewayApiExposure({ className: "eg", hosts }),
+      routing: envoyNativeRouting(),
+    });
+    const compile = (orderedPools: string[]) =>
+      compileTarget(
+        target,
+        context({ pools: orderedPools, defaultPool: "p00" }),
+      ).plan.operations.resources.objects.find((object) => object.kind === "HTTPRoute")!;
+    const route = compile(pools);
+    const rules = (route.body.spec as any).rules;
+    expect(rules).toHaveLength(16);
+    expect(rules.slice(0, -1).map((rule: any) => rule.matches[0].headers[0].value)).toEqual(
+      pools.slice(1, 16),
+    );
+    expect(rules.at(-1).backendRefs).toEqual([{ name: "test-app-origin", port: 3000 }]);
+    expect(compile(pools.toReversed()).body).toEqual(route.body);
+  });
+
+  it("rejects pool header routing without an ext_proc tier", () => {
+    const portable = portableRouting();
+    const routing = {
+      ...portable,
+      origin: (ctx: TargetBuildContext) => ({
+        ...portable.origin(ctx),
+        poolHeaderRouting: true as const,
+      }),
+    };
+    expect(() =>
+      compileTarget(
+        defineTarget({
+          cluster: kubernetesCluster(),
+          exposure: gatewayApiExposure({ className: "example", hosts }),
+          routing,
+        }),
+        context(),
+      ),
+    ).toThrow(/requires ext_proc for poolHeaderRouting/);
   });
 
   it("emits a networking.k8s.io/v1 Ingress targeting the origin Service", () => {
