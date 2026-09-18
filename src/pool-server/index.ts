@@ -1,5 +1,7 @@
 // src/pool-server/index.ts
 import { handOffStaticAsset } from "./middle-cache.js";
+import { createRetentionReader } from "../retention.js";
+import { proxyRetainedBuild } from "./retention.js";
 import { createReadStream, readFileSync, existsSync, realpathSync, statSync } from "node:fs";
 import { pipeline } from "node:stream";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -2040,6 +2042,13 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       : {}),
   });
 
+  const retainedBuild = createRetentionReader({
+    buildId,
+    ...(process.env.ADAPTER_K8S_RETENTION_FILE
+      ? { file: process.env.ADAPTER_K8S_RETENTION_FILE }
+      : {}),
+    ...(process.env.INTERNAL_HEADER_SECRET ? { secret: process.env.INTERNAL_HEADER_SECRET } : {}),
+  });
   handleRequest = async (req, res) => {
     let url: URL;
     try {
@@ -2056,6 +2065,19 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       // 500 — it's the client's own protocol error.
       res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
       res.end("Bad Request");
+      return;
+    }
+
+    const retained = await retainedBuild(
+      url,
+      req.method ?? "GET",
+      typeof req.headers["x-deployment-id"] === "string"
+        ? req.headers["x-deployment-id"]
+        : undefined,
+      typeof req.headers["next-action"] === "string" ? req.headers["next-action"] : undefined,
+    );
+    if (retained) {
+      await proxyRetainedBuild(req, res, retained.origin, retained.responseHeadTimeoutMs);
       return;
     }
 

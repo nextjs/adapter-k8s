@@ -1,3 +1,4 @@
+import { renderRetentionInventory } from "../../src/emit/templates/retention.js";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -169,38 +170,61 @@ describe.skipIf(!helm || !kubeconform)("generated chart Kubernetes schemas", () 
     }
   });
 
-  it("strict-validates native resources in the Envoy profile and names each skipped CRD", () => {
-    const config = {
-      pools: { default: { routes: ["appPages"] } },
-      provider: {
-        generic: {
-          gateway: {
-            className: "eg",
-            hosts: [{ hostname: "app.example.com", tls: { enabled: true } }],
-            tlsSecretName: "app-tls",
+  it.each([false, true])(
+    "strict-validates the Envoy profile with retention=%s and names each skipped CRD",
+    (retention) => {
+      const config = {
+        retention: { enabled: retention },
+        pools: { default: { routes: ["appPages"] } },
+        provider: {
+          generic: {
+            gateway: {
+              className: "eg",
+              hosts: [{ hostname: "app.example.com", tls: { enabled: true } }],
+              tlsSecretName: "app-tls",
+            },
           },
         },
-      },
-    } as K8sAdapterConfig;
-    const output = renderAndValidate(
-      "schema-envoy",
-      generateHelmChart({
-        pools,
-        buildId: "schema-build",
-        nextVersion: "16.3.3",
-        config,
-        imageRegistry: "registry.example.com/schema",
-        routingManifest,
-        releaseName: "schema-envoy",
-        internalSecret: "b".repeat(64),
-        extensionChainJson,
-      }),
-      ["Gateway", "HTTPRoute", "ClientTrafficPolicy", "EnvoyExtensionPolicy"],
-    );
-    expect(output).toContain("Invalid: 0");
-    expect(output).toContain("Errors: 0");
-    expect(output).toMatch(/Skipped: [1-9]/);
-  });
+      } as K8sAdapterConfig;
+      const output = renderAndValidate(
+        "schema-envoy",
+        {
+          ...generateHelmChart({
+            pools,
+            buildId: "schema-build",
+            nextVersion: "16.3.3",
+            config,
+            imageRegistry: "registry.example.com/schema",
+            routingManifest,
+            releaseName: "schema-envoy",
+            internalSecret: "b".repeat(64),
+            extensionChainJson,
+          }),
+          ...(retention
+            ? {
+                "templates/retained-build-inventory.yaml": renderRetentionInventory(
+                  "schema-envoy",
+                  {
+                    buildId: "schema-build",
+                    deploymentId: "schema-build",
+                    defaultPool: "default",
+                    pools: ["default"],
+                    gracePeriodSeconds: 300,
+                    assets: [],
+                    actions: [],
+                  },
+                  "b".repeat(64),
+                ),
+              }
+            : {}),
+        },
+        ["Gateway", "HTTPRoute", "ClientTrafficPolicy", "EnvoyExtensionPolicy"],
+      );
+      expect(output).toContain("Invalid: 0");
+      expect(output).toContain("Errors: 0");
+      expect(output).toMatch(/Skipped: [1-9]/);
+    },
+  );
 
   it("strict-validates native resources in the GKE profile and names each skipped CRD", () => {
     const config = {

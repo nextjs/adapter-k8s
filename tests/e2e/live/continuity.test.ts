@@ -9,6 +9,7 @@ import { continuityBuilds } from "../helpers/continuity-builds.js";
 const suppliedA = process.env.E2E_CONTINUITY_A;
 const suppliedB = process.env.E2E_CONTINUITY_B;
 const build = process.env.E2E_CONTINUITY_BUILD === "1";
+const retention = process.env.E2E_CONTINUITY_RETENTION === "1";
 let prepared: Awaited<ReturnType<typeof continuityBuilds>>;
 type Browser = Awaited<ReturnType<typeof chromium>>;
 type Page = Awaited<ReturnType<Browser["page"]>>;
@@ -20,7 +21,7 @@ describe.skipIf(!build && (!suppliedA || !suppliedB))("browser continuity across
   afterAll(async () => {
     await prepared?.cleanup();
   });
-  for (const runtime of build ? ["pool", "next"] : ["supplied"])
+  for (const runtime of build ? (retention ? ["pool"] : ["pool", "next"]) : ["supplied"])
     describe(runtime, () => {
       let A: string;
       let B: string;
@@ -85,6 +86,12 @@ describe.skipIf(!build && (!suppliedA || !suppliedB))("browser continuity across
           try {
             await interact(page, from, to);
           } catch (error) {
+            console.log(
+              JSON.stringify({
+                requests: page.requests.filter((r) => r.type === "Fetch"),
+                document: await page.evaluate("document.body.innerText.slice(0, 400)"),
+              }),
+            );
             errors.push(error);
           } finally {
             console.log(
@@ -97,17 +104,18 @@ describe.skipIf(!build && (!suppliedA || !suppliedB))("browser continuity across
 
       it("navigates in an already-open tab after promotion and rollback", async () => {
         await acrossBuilds(async (page, _from, to) => {
+          const expected = to;
           await page.evaluate(
             'document.querySelector("[data-testid=continuity-navigate]").click()',
           );
           await page.waitFor(
-            `document.querySelector("[data-testid=continuity-destination]")?.textContent === ${JSON.stringify(to)}`,
+            `document.querySelector("[data-testid=continuity-destination]")?.textContent === ${JSON.stringify(expected)}`,
           );
           expect(
             await page.evaluate(
               'document.querySelector("[data-testid=continuity-destination]").textContent',
             ),
-          ).toBe(to);
+          ).toBe(expected);
         });
       }, 60_000);
 
@@ -148,11 +156,12 @@ describe.skipIf(!build && (!suppliedA || !suppliedB))("browser continuity across
         });
       }, 60_000);
       it("handles an old Server Action without silently replaying a mutation", async () => {
-        await acrossBuilds(async (page, _from, to) => {
+        await acrossBuilds(async (page, from, to) => {
+          const expected = retention ? from : to;
           await page.send("Network.clearBrowserCookies");
           await page.evaluate('document.querySelector("[data-testid=continuity-submit]").click()');
           await page.waitFor(
-            `document.querySelector("[data-testid=continuity-result]")?.textContent === ${JSON.stringify(to + ":1:draft")} || (document.querySelector("[data-testid=continuity-version]")?.textContent === ${JSON.stringify(to)} && document.querySelector("[data-testid=continuity]")?.dataset.hydrated === "true")`,
+            `document.querySelector("[data-testid=continuity-result]")?.textContent === ${JSON.stringify(expected + ":1:draft")} || (document.querySelector("[data-testid=continuity-version]")?.textContent === ${JSON.stringify(to)} && document.querySelector("[data-testid=continuity]")?.dataset.hydrated === "true")`,
           );
           if (
             (await page.evaluate(
@@ -164,13 +173,13 @@ describe.skipIf(!build && (!suppliedA || !suppliedB))("browser continuity across
             );
           }
           await page.waitFor(
-            `document.querySelector("[data-testid=continuity-result]")?.textContent === ${JSON.stringify(to + ":1:draft")}`,
+            `document.querySelector("[data-testid=continuity-result]")?.textContent === ${JSON.stringify(expected + ":1:draft")}`,
           );
           expect(
             await page.evaluate(
               'document.querySelector("[data-testid=continuity-result]").textContent',
             ),
-          ).toBe(to + ":1:draft");
+          ).toBe(expected + ":1:draft");
         });
       }, 60_000);
 

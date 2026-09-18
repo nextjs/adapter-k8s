@@ -142,6 +142,8 @@ export interface K8sAdapterConfig {
   middleCache?: { enabled: boolean };
   /** Compress responses with Envoy outside Node. Enabled by default on every target. */
   compression?: { enabled: boolean };
+  /** Keep one previous build routable for old tabs. Disabled by default. */
+  retention?: { enabled: boolean; gracePeriodSeconds?: number };
   containerStrategy?: "traced-assets" | "shared-image";
   /**
    * Names of `kubernetes.io/dockerconfigjson` Secrets (e.g. `docker-regcred`) in the app

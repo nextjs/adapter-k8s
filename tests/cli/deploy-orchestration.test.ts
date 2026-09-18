@@ -1063,7 +1063,7 @@ describe("runDeploy — orchestration", () => {
     expect(events).toContain("writeState");
     expect(events).toContain("delete-hpa:rel-ssr-buildm-hpa");
     expect(events).not.toContain("scale:deployment/rel-ssr-buildm");
-    expect(printedWarnings()).toContain("could immediately undo a scale to zero");
+    expect(printedWarnings()).toContain("could immediately undo the standby replica count");
   });
 
   it("uses Helm 3's client-side upgrade without passing Helm 4-only flags", async () => {
@@ -1430,7 +1430,11 @@ describe("runDeploy — guards and teardown", () => {
     // The listing was scoped to this release's snapshot ConfigMaps.
     const listing = vi
       .mocked(execCapture)
-      .mock.calls.find(([, a]) => a.includes("configmaps"))![1]
+      .mock.calls.find(
+        ([, a]) =>
+          a.includes("configmaps") &&
+          a.some((value) => value.includes("component=routing-manifest-snapshot")),
+      )![1]
       .join(" ");
     expect(listing).toContain("app.kubernetes.io/component=routing-manifest-snapshot");
     expect(listing).toContain(`app.kubernetes.io/name=${RELEASE}`);

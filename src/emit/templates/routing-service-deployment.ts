@@ -1,3 +1,4 @@
+import { retentionEnv, retentionMount, retentionVolume } from "./retention.js";
 import {
   sanitizeK8sName,
   assertSafeBuildId,
@@ -71,6 +72,7 @@ export function renderRoutingServiceDeployment({
   env,
   envFrom,
   deploymentId,
+  retention = false,
   providerName,
   nodeArchitecture = "amd64",
   pullSecrets,
@@ -96,6 +98,7 @@ export function renderRoutingServiceDeployment({
   envFrom?: EnvFromSource[];
   /** next.config `deploymentId` — see renderDeployment; node middleware runs here. */
   deploymentId?: string;
+  retention?: boolean;
   /** Routing target component stamped onto adapter-owned OTEL signals. */
   providerName?: string;
   nodeArchitecture?: TargetArchitecture;
@@ -280,9 +283,9 @@ ${pullSecretsBlock}      nodeSelector:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
-${internalSecretEnv}${deploymentIdEnv}${providerNameEnv}${userEnv}${userEnvFrom}
+${retention ? retentionEnv : ""}${internalSecretEnv}${deploymentIdEnv}${providerNameEnv}${userEnv}${userEnvFrom}
           volumeMounts:
-            - name: routing-manifest
+${retention ? retentionMount : ""}            - name: routing-manifest
               mountPath: /config
             # readOnlyRootFilesystem makes / read-only; the runtime TLS cert
             # generation writes under /tmp/tls, backed by this emptyDir. NOT in-memory
@@ -323,7 +326,7 @@ ${internalSecretEnv}${deploymentIdEnv}${providerNameEnv}${userEnv}${userEnvFrom}
               cpu: "${cpuLim}"
               memory: "${memLim}"
       volumes:
-        - name: routing-manifest
+${retention ? retentionVolume(releaseName) : ""}        - name: routing-manifest
           configMap:
             # PER-BUILD, deliberately (2026-07-30): mounting the stable mutable CM raced
             # kubelet's ConfigMap-update propagation on every deploy — a new pod could mount

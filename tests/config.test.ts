@@ -4,6 +4,19 @@ import { validateConfig, applyDefaults } from "../src/config.js";
 import type { K8sAdapterConfig } from "../src/types.js";
 
 describe("validateConfig", () => {
+  it.each([
+    null,
+    true,
+    [],
+    {},
+    { enabled: "yes" },
+    { enabled: true, gracePeriodSeconds: 0 },
+    { enabled: true, gracePeriodSeconds: 3601 },
+    { enabled: true, gracePeriodSeconds: 1.5 },
+  ])("rejects malformed retention config %j", (retention) => {
+    expect(() => validateConfig({ retention })).toThrow(/retention requires/);
+  });
+
   it.each([null, true, [], {}, { enabled: "yes" }])(
     "rejects malformed compression config %j",
     (compression) => {

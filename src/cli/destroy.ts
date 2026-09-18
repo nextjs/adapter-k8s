@@ -1094,6 +1094,19 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
       `app.kubernetes.io/component=${ROUTING_MANIFEST_SNAPSHOT_COMPONENT})`,
   });
 
+  await deleteOwnedKubernetes({
+    args: [
+      "delete",
+      "configmap",
+      "-n",
+      namespace,
+      "-l",
+      `app.kubernetes.io/name=${releaseName},app.kubernetes.io/component=retained-build-inventory`,
+      "--ignore-not-found",
+    ],
+    description: "retained build inventories",
+  });
+
   const compositionDeleteArgs = [
     "delete",
     "configmap",

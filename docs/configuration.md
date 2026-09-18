@@ -298,6 +298,50 @@ public port and readiness checks traverse the proxy. Its shutdown hook waits for
 balancer draining before draining active connections. Local `emulate` uses the same codecs
 in its existing front proxy.
 
+## Previous-build retention
+
+```js
+retention: { enabled: true, gracePeriodSeconds: 300 }
+```
+
+Retention is disabled by default. Enable it in two successive builds to keep an open
+tab's previously unrequested immutable chunks and pending Server Actions usable across
+promotion and rollback. The adapter supplies a unique Next deployment ID when the app
+does not configure one. Ordinary navigation still follows Next's recovery onto the
+current build.
+
+Only the immediately previous build is retained. Each of its pools keeps one replica,
+including its configured sidecars, with its HPA removed. **These standby replicas remain
+after the serving deadline**, ready for rollback, until the next deployment removes the
+superseded build. This bounds standby capacity to one previous build; it does not scale
+the standby to zero on a timer. Leave retention disabled to keep the usual zero-replica
+rollback target.
+
+`gracePeriodSeconds` accepts integers from 1 to 3600 and defaults to 300. After successful
+cutover, the CLI publishes a signed serving deadline with an additional 120-second
+ConfigMap propagation allowance. A preparation record has a one-hour expiry so an
+interrupted promotion cannot leave public forwarding enabled indefinitely. A subsequent
+deployment can evict the older build before its deadline. After eviction or expiry,
+missing chunks and stale action IDs use the current build's normal error behavior;
+mutations are never automatically retried.
+
+The adapter matches only build-inventoried `/_next/static/immutable/` paths and Server
+Action IDs. It forwards the original request to the retained build without a trusted
+middleware verdict, so that build runs its own middleware and routing. Retained responses
+use `Cache-Control: no-store` to prevent them from populating the current build's CDN
+cache. Mutable public files, image optimization, ordinary API POSTs, and WebSocket
+connections are outside this policy. Non-hydrated form submissions without a
+`Next-Action` header are also outside it.
+
+Serialize deployments and rollbacks for a release. Both builds must have retention
+enabled and the same pool names. A topology change
+disables retention for that cutover and parks the previous build at zero replicas;
+retaining renamed pools requires additional NetworkPolicy support. Inventories are
+limited to 200 KB per build and the signed index to 800 KB. Deploy and rollback verify
+inventory signatures and wait for the index to reach ready pods before switching
+selectors. The old build must remain compatible with your shared data and services for
+the entire serving window.
+
 ## Not yet implemented
 
 The old `imageOptimizer`, `skewProtection`, and top-level `routeExtension` keys were placeholders. They never changed emitted workloads and are no longer part of `K8sAdapterConfig`. Validation rejects them with a removal message instead of silently ignoring stale configuration. The implemented GKE routing timeout remains at `provider.gke.serviceExtensions.routeExtension.timeout` during the legacy migration window.

@@ -1,4 +1,5 @@
 import { resolveRoutes, responseToMiddlewareResult } from "@next/routing";
+import { createRetentionReader } from "../retention.js";
 import type { RoutingManifest } from "../types.js";
 import { invokeNodeMiddleware } from "../next-runtime/middleware-entrypoint.js";
 import { resolveNextDistDir } from "../next-runtime/dist-dir.js";
@@ -176,6 +177,13 @@ export function createRequestHandler(
   // (injected from a Secret); absent in emulate/tests, where the pool trusts nothing over the
   // wire and re-resolves locally. Read once — the deployment env is fixed for the process.
   const internalSecret = process.env.INTERNAL_HEADER_SECRET || undefined;
+  const retainedBuild = createRetentionReader({
+    buildId: manifest.buildId,
+    ...(internalSecret ? { secret: internalSecret } : {}),
+    ...(process.env.ADAPTER_K8S_RETENTION_FILE
+      ? { file: process.env.ADAPTER_K8S_RETENTION_FILE }
+      : {}),
+  });
   // The build-derived request headers the dispatch proof must bind (see buildProofHeaderNames):
   // the middleware-matcher inputs, because `matchesMiddleware` below derives the `x-mw-evaluated`
   // verdict from them (so a proof that left them unbound could be lifted from a `skip-nomatch`
@@ -296,6 +304,27 @@ export function createRequestHandler(
         )
         .map((h) => [h.key, h.value ?? h.rawValue?.toString("utf-8") ?? ""] as [string, string]),
     );
+
+    // A retained request must be resolved with that build's middleware and route table.
+    // Clear every verdict so the stable origin performs the authenticated retention hop.
+    if (
+      await retainedBuild(
+        url,
+        method,
+        headers.get("x-deployment-id") ?? undefined,
+        headers.get("next-action") ?? undefined,
+      )
+    ) {
+      return buildHeaderMutationResponse(
+        [],
+        [
+          ...INTERNAL_DISPATCH_HEADERS,
+          ...UNTRUSTED_NEXT_REQUEST_HEADERS,
+          INTERNAL_SECRET_HEADER,
+          INTERNAL_DISPATCH_PROOF_HEADER,
+        ],
+      );
+    }
 
     // Edge middleware requires Next's sandbox, which only the pool runtime owns today. Do not
     // import the edge bundle as a Node module and do not stamp `none`: clear the whole internal

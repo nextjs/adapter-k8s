@@ -281,6 +281,7 @@ export function generateHelmChart({
     const mergedEnv = { ...config.env, ...poolConfig?.env };
     const mergedEnvFrom = [...(config.envFrom ?? []), ...(poolConfig?.envFrom ?? [])];
     files[`templates/${poolName}-deployment.yaml`] = renderDeployment({
+      retention: config.retention?.enabled === true,
       middleCache: config.middleCache?.enabled === true,
       compression: config.compression?.enabled !== false,
       poolName,
@@ -330,6 +331,7 @@ export function generateHelmChart({
   if (wantsRoutingTier) {
     const rs = config.routingService;
     files["templates/routing-service-deployment.yaml"] = renderRoutingServiceDeployment({
+      retention: config.retention?.enabled === true,
       releaseName,
       buildId,
       providerName: routingProviderName,

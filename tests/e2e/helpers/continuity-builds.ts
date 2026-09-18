@@ -12,6 +12,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { execCapture, execCaptureOrThrow } from "../../../src/cli/exec.js";
+import { signRetention } from "../../../src/retention.js";
 
 /** Build twice from the published file set, then expose the real pool and next start. */
 export async function continuityBuilds() {
@@ -23,6 +24,7 @@ export async function continuityBuilds() {
   const root = mkdtempSync(path.join(tmpdir(), "adapter-continuity-builds-"));
   const deploymentId = (marker: string) =>
     process.env.E2E_CONTINUITY_DEPLOYMENT_IDS === "1" ? `continuity-${marker}` : "";
+  const retention = process.env.E2E_CONTINUITY_RETENTION === "1";
   const children: { controller: AbortController; lifetime: Promise<void> }[] = [];
   const origins: Record<string, { A: string; B: string }> = {
     pool: { A: "", B: "" },
@@ -55,7 +57,7 @@ export async function continuityBuilds() {
       writeFileSync(
         path.join(app, "adapter.config.mjs"),
         `import { createK8sAdapter } from "@next-community/adapter-k8s";
-export default createK8sAdapter({ cache: { enabled: false }, compression: { enabled: false },
+export default createK8sAdapter({ cache: { enabled: false }, compression: { enabled: false }, retention: { enabled: ${retention} },
   pools: { default: { routes: ["appPages", "appRoutes", "pages", "pagesApi"] } },
   provider: { gke: { gateway: { type: "gateway-api", className: "gke-l7-global-external-managed",
     hosts: [{ hostname: "continuity.invalid", tls: { enabled: false } }] } } }
@@ -101,6 +103,14 @@ process.stdout.write = (chunk, ...args) => {
         const meta = JSON.parse(
           readFileSync(path.join(app, ".k8s-adapter/output/build-metadata.json"), "utf8"),
         );
+        const runtimeDeploymentId = retention
+          ? JSON.parse(
+              readFileSync(
+                path.join(app, ".k8s-adapter/output/retained-build-inventory.json"),
+                "utf8",
+              ),
+            ).deploymentId
+          : deploymentId(marker);
         const args =
           runtime === "pool"
             ? ["node_modules/@next-community/adapter-k8s/dist/pool-server.cjs"]
@@ -112,11 +122,17 @@ process.stdout.write = (chunk, ...args) => {
           timeoutMs: 600_000,
           env: {
             NODE_ENV: "production",
-            NEXT_DEPLOYMENT_ID: deploymentId(marker),
+            NEXT_DEPLOYMENT_ID: runtimeDeploymentId,
             PORT: "0",
             POOL_NAME: "default",
             NEXT_BUILD_ID: meta.buildId,
             CONFIG_DIR: path.join(app, ".k8s-adapter/output"),
+            ...(retention
+              ? {
+                  ADAPTER_K8S_RETENTION_FILE: path.join(root, "retention.json"),
+                  INTERNAL_HEADER_SECRET: `continuity-test-${marker}`,
+                }
+              : {}),
             ADAPTER_K8S_LISTEN_HOST: "127.0.0.1",
           },
         }).then(
@@ -139,6 +155,25 @@ process.stdout.write = (chunk, ...args) => {
         }
         origins[runtime]![marker] = `http://127.0.0.1:${Number(readFileSync(portFile, "utf8"))}`;
       }
+    if (retention) {
+      const builds = (["A", "B"] as const).map((marker) => ({
+        ...JSON.parse(
+          readFileSync(
+            path.join(root, marker, ".k8s-adapter/output/retained-build-inventory.json"),
+            "utf8",
+          ),
+        ),
+        origin: origins.pool![marker],
+        expiresAt: Date.now() + 300_000,
+      }));
+      writeFileSync(
+        path.join(root, "retention.json"),
+        JSON.stringify({
+          [builds[0].buildId]: signRetention(builds, "continuity-test-A"),
+          [builds[1].buildId]: signRetention(builds, "continuity-test-B"),
+        }),
+      );
+    }
     return { origins, cleanup };
   } catch (error) {
     await cleanup();
