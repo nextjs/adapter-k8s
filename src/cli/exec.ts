@@ -20,6 +20,8 @@ export interface ExecCaptureResult {
 
 export interface ExecOptions {
   cwd?: string;
+  /** Cancel an owned background process, including when a browser/test setup fails. */
+  signal?: AbortSignal;
   /**
    * Optional hard cap on the child's lifetime. On expiry the child is SIGKILLed and the
    * promise resolves with exitCode 124 + timedOut: true (execCapture also notes the timeout
@@ -226,6 +228,7 @@ export function exec(command: string, args: string[], options?: ExecOptions): Pr
       cwd: options?.cwd,
       shell: false, // M2: never a shell we don't escape for (see buildWindowsCmdInvocation)
       windowsVerbatimArguments: plan.windowsVerbatimArguments,
+      ...(options?.signal ? { signal: options.signal, killSignal: "SIGKILL" as const } : {}),
     });
     // S28: forward line-by-line through the sanitizer. Partial lines are held until their
     // newline arrives so a control sequence cannot be split across two chunks and slip
@@ -287,6 +290,7 @@ function spawnCapture(
       ...(options?.env ? { env: { ...process.env, ...options.env } } : {}),
       shell: false, // M2: never a shell we don't escape for (see buildWindowsCmdInvocation)
       windowsVerbatimArguments: plan.windowsVerbatimArguments,
+      ...(options?.signal ? { signal: options.signal, killSignal: "SIGKILL" as const } : {}),
     });
 
     let stdout = "";

@@ -175,6 +175,15 @@ The specific behaviors the architecture exists to get right, each confirmed agai
 
 ## Known coverage gaps
 
+- **Already-open tabs can lose access to old build artifacts after cutover.** A local
+  Chromium comparison on 2026-09-17 with Next.js 16.3.4 exercised both promotion and
+  rollback against the pool runtime and `next start`. Navigation recovered onto the
+  current build, and current-build Server Actions worked. Previously unrequested lazy
+  chunks returned 404 with `ChunkLoadError`; stale Server Action IDs returned 404 with
+  `UnrecognizedActionError`. The comparison produced the same results with explicit
+  per-build deployment IDs. Neither failure automatically recovered. The opt-in browser
+  suite below remains red for these gaps. This comparison switches a loopback proxy
+  between production builds; it does not verify Kubernetes, Envoy, or CDN behavior.
 - **Full-topology runs are operator-initiated, not per-commit CI.** The cluster-topology
   suite (layer 2) covers the ext_proc path end to end, but it runs on a local k3d cluster
   when a maintainer launches it—hours, not minutes. Pull requests are gated by the unit,
@@ -217,6 +226,37 @@ Response compression has a real Envoy transport suite:
 It defaults to Docker and skips when no runtime is available. The Linux-only suite uses
 loopback sockets and host networking, verifies codec negotiation and decoded payloads,
 streaming, range exclusions, response metadata and signed dispatch headers.
+
+### Browser continuity across builds
+
+```sh
+E2E_CONTINUITY_NEXT_VERSION=16.3.4 npm run test:e2e:continuity
+```
+
+This maintainer command builds and packs the adapter once, installs the pinned Next
+version into two temporary copies of `fixtures/main`, and builds them with distinct
+content and Server Action IDs. It starts both builds under the pool server and
+`next start`, then uses a private headless Chromium profile and a loopback proxy to
+switch the serving build while a tab stays open. Both A-to-B promotion and B-to-A
+rollback run even if one direction fails. It also checks current-build Server Actions
+as a control. No cluster credentials or deployment are needed.
+
+Use Node 24 and a Chromium installation. Set `CHROMIUM_PATH` if the binary is not
+`/usr/bin/chromium`. Dependency installation needs registry access. The command fails
+when continuity breaks; it is separate from the hermetic unit suite and currently
+reports the known failures above. Browser caching is disabled to exercise cold asset
+requests. Successful warm-cache behavior is not evidence that old assets remain
+available at the origin.
+
+Set `E2E_CONTINUITY_DEPLOYMENT_IDS=1` to give the builds explicit `continuity-A` and
+`continuity-B` deployment IDs. Set `E2E_CONTINUITY_KEEP=1` to retain temporary build
+artifacts and logs; the command prints their location. To compare existing local HTTP
+origins built with `NEXT_PUBLIC_CONTINUITY_VERSION=A` and `B`, run only the test:
+
+```sh
+E2E_CONTINUITY_A=http://127.0.0.1:3001 E2E_CONTINUITY_B=http://127.0.0.1:3002 \
+  npx vitest run --config vitest.e2e-live.config.ts tests/e2e/live/continuity.test.ts
+```
 
 ## See also
 
