@@ -4,7 +4,7 @@
 // is silent until something deploys somewhere unintended (a GKE deploy pushing to a Scaleway
 // registry, say).
 import { describe, it, expect, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -15,12 +15,15 @@ import {
 } from "../src/cli/infrastructure-validation.js";
 
 const saved = { ...process.env };
+const projectDirs: string[] = [];
 afterEach(() => {
   process.env = { ...saved };
+  for (const dir of projectDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
 function project(files: Record<string, string>): string {
   const dir = mkdtempSync(path.join(tmpdir(), "variant-"));
+  projectDirs.push(dir);
   mkdirSync(path.join(dir, ".k8s-adapter"), { recursive: true });
   for (const [rel, body] of Object.entries(files)) {
     writeFileSync(path.join(dir, rel), body);
