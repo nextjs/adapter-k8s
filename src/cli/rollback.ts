@@ -91,9 +91,10 @@ export async function runRollback(options: {
   projectDir: string;
   releaseName: string;
   dryRun?: boolean;
+  skipCleanup?: boolean;
   yes?: boolean;
 }): Promise<void> {
-  const { projectDir, releaseName, dryRun, yes } = options;
+  const { projectDir, releaseName, dryRun, yes, skipCleanup } = options;
 
   const infraPath = infrastructurePath(projectDir);
   const infra = existsSync(infraPath) ? JSON.parse(readFileSync(infraPath, "utf-8")) : undefined;
@@ -292,7 +293,11 @@ export async function runRollback(options: {
       `  [dry-run] Would patch active Service selectors to app.kubernetes.io/version=${sanitizeK8sName(previousBuildId)}`,
     );
     if (currNames.length > 0)
-      console.log(`  [dry-run] Would scale down current build: ${currNames.join(", ")}`);
+      console.log(
+        skipCleanup
+          ? `  [dry-run] Would retain current build capacity: ${currNames.join(", ")}`
+          : `  [dry-run] Would scale down current build: ${currNames.join(", ")}`,
+      );
     console.log(
       `  [dry-run] Would swap state: buildId=${previousBuildId}, previousBuildId=${currentBuildId}`,
     );
@@ -401,6 +406,7 @@ export async function runRollback(options: {
       currentPoolNames,
       previousDeploys,
       currentDeploys,
+      skipCleanup: skipCleanup ?? false,
       scalingByPool,
       state,
       targetComposition,

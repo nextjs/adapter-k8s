@@ -85,6 +85,27 @@ export async function replaceServiceSelector(opts: {
   if (!annotations?.["cloud.google.com/neg"] && !annotations?.["cloud.google.com/neg-status"])
     return replace(namespace, service, original, next);
 
+  // GKE's admission webhook adds {ingress:true} to internal ClusterIP Services
+  // too. That marker alone creates no NEG. Standalone exposed ports or an
+  // observed NEG still require backend health and fail closed if incomplete.
+  if (!annotations?.["cloud.google.com/neg-status"]) {
+    try {
+      const requested: unknown = JSON.parse(annotations?.["cloud.google.com/neg"] ?? "null");
+      if (
+        requested &&
+        typeof requested === "object" &&
+        !Array.isArray(requested) &&
+        Object.keys(requested).length === 1 &&
+        "ingress" in requested &&
+        requested.ingress === true
+      ) {
+        return replace(namespace, service, original, next);
+      }
+    } catch {
+      // Malformed annotations take the existing fail-closed verification path.
+    }
+  }
+
   const key = `adapter-k8s.io/warm-${randomUUID().replaceAll("-", "")}`;
   const labelPath = `/metadata/labels/${key.replaceAll("/", "~1")}`;
   const overlap = { ...original, [key]: "1" };
