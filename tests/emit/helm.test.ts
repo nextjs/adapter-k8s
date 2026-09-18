@@ -305,6 +305,67 @@ describe("generateHelmChart", () => {
     expect(result["templates/ssr-service.yaml"]).not.toContain("HealthCheckPolicy");
   });
 
+  it.each(["site-origin", "another-service"])(
+    "respects an explicit backend policy only for its target %s",
+    (serviceName) => {
+      const target = defineTarget({
+        cluster: gkeCluster({ projectId: "cluster-project", region: "us-central1" }),
+        exposure: gatewayApiExposure({
+          className: "gke-l7-global-external-managed",
+          hosts: [{ hostname: "app.example.com", tls: { enabled: false } }],
+          backendHealth: gkeHealthCheckPolicy(),
+        }),
+      });
+      const config = { pools: { ssr: { routes: ["appPages"] } }, target } as K8sAdapterConfig;
+      const compiledTarget = compileTarget(target, {
+        releaseName: "site",
+        namespace: "apps",
+        buildId: "abc123",
+        imageRegistry: "us-central1-docker.pkg.dev/cluster-project/nextjs",
+        pools: ["ssr"],
+        defaultPool: "ssr",
+        failurePolicy: "closed",
+      });
+      compiledTarget.plan.operations.resources.objects.push({
+        apiVersion: "networking.gke.io/v1",
+        kind: "GCPBackendPolicy",
+        resource: "gcpbackendpolicies",
+        metadata: { name: "custom-chat-policy", namespace: "apps" },
+        body: {
+          spec: {
+            default: { timeoutSec: 600 },
+            targetRef: { group: "", kind: "Service", name: serviceName },
+          },
+        },
+      });
+      const generate = () =>
+        generateHelmChart({
+          pools: minimalPools(),
+          buildId: "abc123",
+          nextVersion: "16.3.3",
+          config,
+          imageRegistry: "us-central1-docker.pkg.dev/cluster-project/nextjs",
+          routingManifest: mockManifest,
+          releaseName: "site",
+          internalSecret: "deadbeef",
+          compiledTarget,
+        });
+      const result = generate();
+      expect(result["templates/origin-service.yaml"]).toContain("kind: HealthCheckPolicy");
+      expect(result["templates/origin-service.yaml"].includes("kind: GCPBackendPolicy")).toBe(
+        serviceName !== "site-origin",
+      );
+      expect(Object.values(result).join("\n")).toContain("custom-chat-policy");
+      if (serviceName === "site-origin") {
+        compiledTarget.plan.operations.resources.objects.push({
+          ...compiledTarget.plan.operations.resources.objects.at(-1)!,
+          metadata: { name: "conflicting-policy", namespace: "apps" },
+        });
+        expect(generate).toThrow(/Multiple GCPBackendPolicies/);
+      }
+    },
+  );
+
   it("renders an httpRouteExposure target with an HTTPRoute and no Gateway anywhere", () => {
     const target = defineTarget({
       cluster: kubernetesCluster(),
