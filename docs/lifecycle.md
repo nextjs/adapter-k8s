@@ -101,11 +101,13 @@ The terminal behavior is protocol-specific:
   tunnels that could not be given a `1001`; a persistent non-zero value under scale-down is the
   signal that clients are ending on close code 1006.
 
-For the generic Envoy target, generated application rules disable Envoy's 15-second total route
-deadline with `timeouts.request: 0s`; the gateway's stream-idle timeout still detects a connection
-that stops making progress. Other exposure layers supplied by an operator need equivalent
-streaming and WebSocket behavior. Provider-specific GKE backend draining/timeout policy is not
-changed by this portable contract.
+For long streams through Envoy, set `requestTimeout: "0s"` on `gatewayApiExposure` or
+`httpRouteExposure`. This disables Envoy's 15-second total route deadline. Configure
+`streamIdleTimeout` separately if stalled streams must expire; Envoy Gateway can disable
+the default idle deadline too when the request timeout is zero. Omitting the option leaves the controller's default.
+See [streaming and request timeouts](./targets.md#streaming-and-request-timeouts).
+Other exposure layers supplied by an operator need equivalent streaming and WebSocket behavior.
+Provider-specific GKE backend draining/timeout policy is not changed by this portable contract.
 
 This is graceful degradation, not an exactly-once guarantee. An involuntary node loss, process
 crash, exhausted grace period, or abrupt load-balancer reset can still break a connection without

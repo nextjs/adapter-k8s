@@ -155,6 +155,30 @@ Notes on this journey:
 - **Escaped slashes**: `gatewayApiExposure` + `envoyNativeRouting` normally emits a `ClientTrafficPolicy` (`escapedSlashesAction: KeepUnchanged`) for `next start` parity on paths like `/a%2Fb`. A ClientTrafficPolicy is Gateway-scoped and namespace-local, so it **cannot** reach a shared Gateway in another namespace — and Envoy Gateway rejects a second conflicting CTP per listener anyway. With a cross-namespace parent, the policy is suppressed automatically and an explicit `escapedSlashes: "policy"` is a build error. Escaped-slash parity becomes a documented requirement on the shared gateway's owner (a CTP or EnvoyPatchPolicy in the gateway's namespace).
 - **Envoy Gateway version floor** for `envoyNativeRouting` on this exposure: the EnvoyExtensionPolicy attaches to the app's HTTPRoute by name (route-scoped ext_proc — the callout fires only for this app's route, not every app on the shared gateway). Route-targeted ext_proc requires **Envoy Gateway ≥ 1.1.0**; the adapter's live-verified range is **>=1.5.4 <1.9** (see [Envoy Gateway native routing](#envoy-gateway-native-routing)).
 
+### Streaming and request timeouts
+
+Both `gatewayApiExposure` and `httpRouteExposure` accept `requestTimeout`, a
+[Gateway API duration](https://gateway-api.sigs.k8s.io/guides/user-guides/http-timeouts/).
+For streamed responses, set `requestTimeout: "0s"` in the exposure options to request
+no whole-response deadline. Envoy disables it; controllers unable to disable it may
+use their longest supported deadline. Use a finite value such as `"30s"` when the application
+needs a total response limit. Omitting the option leaves the controller's default in
+place. This applies to both `portableRouting()` and `envoyNativeRouting()`.
+
+[Envoy Gateway defaults to 15 seconds](https://gateway.envoyproxy.io/docs/tasks/traffic/http-timeouts/),
+which can truncate an active Route Handler stream, RSC response or SSE connection.
+The option emits `spec.rules[].timeouts.request` on the application HTTPRoute only.
+It requires a controller supporting Gateway API request timeouts, an extended feature
+in the standard API since v1.2. Check the controller's support before using it.
+Pool response-header deadlines and configured route `maxDuration` still apply.
+Configure the controller's stream-idle timeout separately to close stalled streams.
+[Envoy Gateway 1.9.1 derives an idle timeout from the request timeout](https://github.com/envoyproxy/gateway/blob/v1.9.1/internal/xds/translator/route.go#L422)
+when neither a route `BackendTrafficPolicy` nor the gateway's `ClientTrafficPolicy`
+sets `timeout.http.streamIdleTimeout`. In that case, `requestTimeout: "0s"` disables
+both default deadlines. Set an explicit `streamIdleTimeout` in the appropriate
+operator-owned policy if idle streams must expire. SSE applications should send
+heartbeats within that limit. This option does not configure nginx Ingress.
+
 ### NetworkPolicy under `strict` with a shared gateway
 
 The shared gateway's proxy pods live in the **parent's** namespace, not the app's. `ingressSources` is the strict allowlist admitting traffic to the pools (`:3000`) and the routing tier (`:8443`) — and because the routing tier authenticates no callers, reachability to `:8443` is what decides who can obtain a pool-trusted routing verdict. External exposure constructors reject an omitted or empty source set; `manualExposure` is the only built-in that may deliberately leave it empty.
@@ -221,13 +245,9 @@ target: defineTarget({
 
 - **Gateway class** must be controlled by `gateway.envoyproxy.io/gatewayclass-controller`—`deploy` verifies the extension policy reports `Accepted=True` before cutting traffic. A non-Envoy class would program the Gateway and then silently never call the routing service.
 - **Verified Envoy Gateway range: >=1.5.4 <1.9.** The adapter's full surface (ext_proc, ClientTrafficPolicy, deploy gates, cutover, rollback) is live-verified on Envoy Gateway v1.5.4, v1.5.5, and v1.8.3 — identical manifests Accepted on all, no adapter-visible behavior change between 1.5.5 and 1.8.3 (1.6/1.7 are untested but inside the range). `deploy` and `doctor` print a soft warning (never a failure) when the detected controller image is outside this range.
-- **Streaming timeout parity:** generated application rules set `timeouts.request: 0s`. Envoy's
-  default is a 15-second whole-response deadline, which is inappropriate for Route Handler
-  streams, RSC, and SSE because it expires even while a response is making progress. Disabling
-  that total deadline does not make dead requests immortal: the pool still bounds time to response
-  headers and route `maxDuration`, and Envoy retains its stream-idle timeout. Applications using
-  SSE should send periodic comment heartbeats frequently enough for their operator's gateway/CDN
-  idle timeout.
+- **Streaming timeout:** set `requestTimeout: "0s"` on the exposure for long streams.
+  Without it, the controller's default whole-response deadline applies even while
+  data is flowing. See [streaming and request timeouts](#streaming-and-request-timeouts).
 - **Upgrading Envoy Gateway 1.5.x → 1.8.x in place: apply the CRDs first.** `helm upgrade` never touches the chart's `crds/` subchart, and Envoy Gateway ≥ 1.8 unconditionally watches `ListenerSet` — so an in-place upgrade crashloops the new controller with `no matches for kind "ListenerSet" in version "gateway.networking.k8s.io/v1"`. Server-side-apply the chart's CRD bundle **before** upgrading the controller (verified live: applied over live CRDs with no data loss, traffic served throughout):
 
   ```bash
