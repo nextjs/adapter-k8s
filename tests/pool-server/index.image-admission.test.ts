@@ -411,9 +411,11 @@ describe("image optimizer — S32 admission and single-flight", () => {
     const webp = Array.from({ length: 3 }, () =>
       get(port, "/_next/image?url=/tiny.png&w=96&q=75", { accept: "image/webp" }),
     );
+    // Joining a key happens before its leader finishes reading the source. Wait for
+    // both encoders too, or a slower source read can leave sharpCalls at one in CI.
     await waitUntil(
-      () => imageOptimizerAdmissionStats().joined - before.joined === 4,
-      "two keys with two joiners each",
+      () => imageOptimizerAdmissionStats().joined - before.joined === 4 && sharpCalls === 2,
+      "both MIME encoders with two joiners each",
     );
     expect(sharpCalls).toBe(2);
     releaseEncodes();
