@@ -194,7 +194,18 @@ The specific behaviors the architecture exists to get right, each confirmed agai
   an old chunk and an unknown action ID returned 404 without mutation replay. The final
   fixture passed all 30 live checks and all 33 doctor checks. The load-balancer error
   query returned no 5xx entries. This covers one pool and successful cloud operations;
-  standby capacity remained one replica after expiry, as documented.
+  standby capacity remained one replica after expiry. That run predates automatic scale-down.
+- **Automatic retention expiry on live GKE.** On September 18, 2026, the scheduled cleanup
+  job scaled the previous build to zero on its first run after the serving deadline,
+  about 33 seconds later. After all standby pods terminated, rollback restored two pods,
+  verified serving readiness, and moved traffic successfully. All 30 live checks passed
+  after rollback. The expiry and rollback phases recorded 26,262 public probes without
+  errors. This verifies one pool under successful cloud operations; unit tests cover
+  stale cleanup racing rollback and ambiguous cluster state.
+  The initial deployment did expose a separate routing-service drain problem: two HTTP
+  500s and nineteen 504s over 33 seconds coincided with the last old routing pod shutting
+  down. Load-balancer logs identified ext_proc `UNAVAILABLE` and `DEADLINE_EXCEEDED`,
+  before cleanup changed any replica counts. Zero-error deployment remains unproven.
 - **Full-topology runs are operator-initiated, not per-commit CI.** The cluster-topology
   suite (layer 2) covers the ext_proc path end to end, but it runs on a local k3d cluster
   when a maintainer launches it—hours, not minutes. Pull requests are gated by the unit,
