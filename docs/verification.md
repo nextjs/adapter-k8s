@@ -225,8 +225,24 @@ The specific behaviors the architecture exists to get right, each confirmed agai
   response about 2ms later. These failures are not explained by shutdown alone.
   The default GKE callout deadline was also corrected from 4s to 5s around the existing
   4000ms handler budget. A subsequent five-minute sample passed 10,669 requests, all
-  30 live tests, and 32 doctor checks. The cause of the delivery delay remains unresolved,
-  and the full deploy/rollback sequence has not been repeated with the corrected budget.
+  30 live tests, and 32 doctor checks. The cause of the delivery delay remains unresolved.
+- **Full cutover repeat with the five-second default.** Later on September 18, 2026,
+  two fresh deployments and rollback ran under 106,419 normal requests and 10,506
+  middleware-denial checks. Eight normal requests failed: three HTTP 500s with ext_proc
+  `UNAVAILABLE` and five HTTP 504s with `DEADLINE_EXCEEDED`. The first deployment had
+  four failures, the second one, and rollback three. All denial checks passed.
+  This run added fresh-connection probes to the earlier page, asset, and keep-alive
+  workload, so its failure rate is not a controlled before/after comparison.
+  All six outgoing routing pods became unhealthy in GCP within 11–19 seconds of
+  readiness withdrawal and completed their 120-second drain without forced teardown.
+  Each deployed or restored build passed all 30 live checks; final doctor passed 32/32.
+  Three correlated failures took 4.4–5.1 seconds to reach Node, which wrote responses
+  2–5ms later with no queued writes and available HTTP/2 flow-control capacity.
+  One used stream 1091 on an established session, so new connection setup alone
+  cannot explain the failures. The earliest 500 also preceded readiness withdrawal
+  and the traffic-extension update. The five-second default is verified through
+  deployment and rollback, but zero-error cutover remains unresolved. Temporary
+  diagnostic observers and inspector listeners were removed afterward.
 - **Full-topology runs are operator-initiated, not per-commit CI.** The cluster-topology
   suite (layer 2) covers the ext_proc path end to end, but it runs on a local k3d cluster
   when a maintainer launches it—hours, not minutes. Pull requests are gated by the unit,
