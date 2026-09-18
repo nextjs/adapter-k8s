@@ -112,6 +112,31 @@ afterEach(() => {
 });
 
 describe("GKE Service cutover", () => {
+  it("does not invent a backend for GKE's automatic ingress annotation on an internal Service", async () => {
+    const result = await replaceServiceSelector({
+      ...opts,
+      annotations: { "cloud.google.com/neg": '{"ingress":true}' },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(patches).toEqual([next]);
+    expect(GkeBackends).not.toHaveBeenCalled();
+    expect(labels.size).toBe(0);
+  });
+
+  it.each([
+    '{"exposed_ports":{"3000":{}}}',
+    '{"ingress":true,"exposed_ports":{"3000":{}}}',
+    "broken-json",
+  ])("refuses incomplete or malformed NEG configuration %s", async (configuration) => {
+    const result = await replaceServiceSelector({
+      ...opts,
+      annotations: { "cloud.google.com/neg": configuration },
+    });
+    expect(result.exitCode).not.toBe(0);
+    expect(patches).toHaveLength(0);
+    expect(selector).toEqual(original);
+  });
+
   it("retains old endpoints until incoming backend health is stable, then removes temporary labels", async () => {
     const result = replaceServiceSelector(opts);
     await vi.advanceTimersByTimeAsync(29_999);
