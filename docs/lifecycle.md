@@ -16,9 +16,54 @@ What `deploy`, `rollback`, `destroy`, and `doctor` actually do, and where deploy
 
 ## Blue/green semantics
 
-Each deploy creates a new versioned Deployment alongside the previous one. Traffic points at a stable active Service whose selector is patched only after every new pod passes readiness _and_ is verified serving via `/readyz` directly on the pod. The previous build is kept at zero replicas as a rollback target.
+Each deploy creates a new versioned Deployment alongside the previous one. Traffic points at a stable active Service whose selector is patched only after every new pod passes readiness _and_ is verified serving via `/readyz` directly on the pod. The previous build is kept at zero replicas as a rollback target by default. Opt-in [previous-build retention](./configuration.md#previous-build-retention) keeps one standby replica per pool and temporarily forwards old immutable assets and Server Actions to it. A cluster cleanup job scales the standby to zero after expiry; rollback restores its capacity before cutover.
+
+For GKE Services backed by a network endpoint group, cutover first selects the ready
+outgoing and incoming pods together using temporary labels. This lets GKE register
+incoming endpoints while outgoing endpoints remain available. The adapter requires
+every incoming endpoint to be healthy in each attached backend for 30 consecutive
+seconds, and verifies that the backend's 60-second connection drain policy has applied,
+before selecting only the incoming build. Middleware can run on either verified build
+during this overlap. Deploy and rollback use the same sequence.
+The backend policy explicitly preserves GKE Gateway's default access logging at 100%
+sampling. Omitting logging from a `GCPBackendPolicy` would disable those logs.
+
+Backend warm-up has a five-minute polling budget. Failed health checks, a changed
+incoming pod set, or a failed final selector update restore the original selector and
+leave the outgoing build running. If restoration cannot be confirmed, both builds and
+the temporary labels remain in place and the command fails. The
+`adapter-k8s.io/backend-warmup` Service annotation holds the exact original and target
+selectors for recovery if the CLI or Job is killed during overlap. Stop any active
+cutover before repairing an interrupted one; do not scale either build down while that
+annotation remains. Successful completion or confirmed restoration removes the annotation.
+
+The CLI's Google identity needs permission to list backend services and read their
+configuration and health. GKE cutover Jobs use the Google metadata token endpoint and
+need a Workload Identity principal with the same Compute read permissions. Tokens are
+used only in HTTPS authorization headers, never passed on command lines. Generic
+Kubernetes Services keep their existing selector switch and need no Google credentials.
 
 `/readyz` is the pod's own verdict: it answers 503 until instrumentation registration has succeeded and at least one route module has imported. The selector value comes from the same sanitizer that stamps the pod label—a mismatch would drain the Service to zero endpoints, which is why both sides derive from one function.
+
+### Routing-service drain
+
+The routing pod's `preStop` hook withdraws `/readyz` through a loopback-only
+`POST /drain`, then keeps serving middleware callouts for 120 seconds while endpoint
+removal propagates. `/healthz` stays live during this interval. SIGTERM then closes
+HTTP/2 sessions gracefully, allowing accepted callouts up to 30 seconds to finish.
+Incomplete handshakes and remaining connections are closed at that deadline.
+
+GKE checks HTTP readiness on port 8081 using `<release>-routing-ready-hc`; the
+routing backend has a 60-second connection drain timeout. The registration Job
+reconciles both settings and leaves an already-correct backend unchanged. The old
+`<release>-routing-hc` TCP check remains until `destroy` removes it.
+
+For an existing GKE installation, re-run `init` with the original infrastructure
+options before deploying this upgrade. This updates the deployment identity's
+custom role with `compute.healthChecks.get`, `create`, `update`, and `useReadOnly`
+permissions. Then rebuild and deploy to install the readiness probes, NetworkPolicy,
+and registration Job. A rollback to an older routing image retains its original
+sleep behavior; that image cannot withdraw readiness through `/drain`.
 
 ### Long-lived requests during cutover
 

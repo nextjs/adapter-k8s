@@ -1425,6 +1425,12 @@ describe("Kubernetes target composition", () => {
         name: "test-app-routing-hc",
         scope: "global",
       },
+      {
+        kind: "gcp-health-check",
+        projectId: "sample-project",
+        name: "test-app-routing-ready-hc",
+        scope: "global",
+      },
       { kind: "gcp-global-address", projectId: "sample-project", name: "test-app-ip" },
     ]);
     expect(compiled.plan.operations.cleanup.retained).toEqual([
@@ -1458,8 +1464,8 @@ describe("Kubernetes target composition", () => {
       {
         kind: "gcp-health-check-shape",
         projectId: "sample-project",
-        name: "test-app-routing-hc",
-        expectedType: "TCP",
+        name: "test-app-routing-ready-hc",
+        expectedType: "HTTP",
       },
     ]);
   });

@@ -49,6 +49,10 @@ export const DEPLOY_EXT_ROLE_PERMISSIONS = [
   "compute.networkEndpointGroups.list",
   "compute.backendServices.get",
   "compute.backendServices.update",
+  "compute.healthChecks.get",
+  "compute.healthChecks.create",
+  "compute.healthChecks.update",
+  "compute.healthChecks.useReadOnly",
   "networkservices.lbTrafficExtensions.create",
   "networkservices.lbTrafficExtensions.update",
   "networkservices.lbTrafficExtensions.get",
@@ -404,11 +408,8 @@ export function buildInitGcloudCommands(options: {
   });
 
   // --- Route Extension Service (ext_proc) ---
-  // Create health check for routing service.
-  // TCP (not gRPC): the routing service serves the ext_proc callout over HTTP/2 *with
-  // TLS*, and a plaintext gRPC health check fails against a TLS server (which would mark
-  // the backend unhealthy and bypass the extension). A TCP check on 8443 stays green for
-  // both the h2c (emulate) and TLS (GKE) transports.
+  // Readiness must turn unhealthy while the TLS listener continues serving callouts.
+  // A distinct name migrates existing TCP checks without deleting an attached resource.
   commands.push({
     description: "Create health check for routing service",
     command: "gcloud",
@@ -416,10 +417,12 @@ export function buildInitGcloudCommands(options: {
       "compute",
       "health-checks",
       "create",
-      "tcp",
-      `${releaseName}-routing-hc`,
+      "http",
+      `${releaseName}-routing-ready-hc`,
       "--port",
-      "8443",
+      "8081",
+      "--request-path",
+      "/readyz",
       "--global",
       "--project",
       projectId,
@@ -444,7 +447,8 @@ export function buildInitGcloudCommands(options: {
       "--protocol",
       "HTTP2",
       "--health-checks",
-      `${releaseName}-routing-hc`,
+      `${releaseName}-routing-ready-hc`,
+      "--connection-draining-timeout=60",
       "--project",
       projectId,
       "--quiet",
@@ -558,7 +562,7 @@ async function checkRoutingResourceCompatibility(
   releaseName: string,
   projectId: string,
 ): Promise<void> {
-  const hc = `${releaseName}-routing-hc`;
+  const hc = `${releaseName}-routing-ready-hc`;
   const bs = `${releaseName}-routing-service`;
   const hcType = (
     await execCapture(
@@ -600,7 +604,8 @@ async function checkRoutingResourceCompatibility(
   const issues: string[] = [];
   if (bsScheme && bsScheme !== "EXTERNAL_MANAGED")
     issues.push(`backend service '${bs}' scheme is ${bsScheme} (needs EXTERNAL_MANAGED)`);
-  if (hcType && hcType !== "TCP") issues.push(`health check '${hc}' type is ${hcType} (needs TCP)`);
+  if (hcType && hcType !== "HTTP")
+    issues.push(`health check '${hc}' type is ${hcType} (needs HTTP)`);
   if (issues.length === 0) return;
 
   console.warn(
@@ -613,7 +618,7 @@ async function checkRoutingResourceCompatibility(
       `fix them. Migrate (brief callout disruption while recreated), then re-run init + deploy:\n` +
       `      gcloud compute backend-services delete ${bs} --global --project=${projectId} --quiet\n` +
       `      gcloud compute health-checks delete ${hc} --global --project=${projectId} --quiet\n` +
-      `      npx adapter-k8s init ...   # recreates them with EXTERNAL_MANAGED + TCP`,
+      `      npx adapter-k8s init ...   # recreates them with EXTERNAL_MANAGED + HTTP readiness`,
   );
 }
 

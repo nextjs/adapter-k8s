@@ -95,7 +95,8 @@ Run `npm test` and `npx tsc --noEmit` before considering any change done.
 2. **Middleware is never bypassed.** CDN must not cache middleware-covered routes (pool sends
    `Cache-Control: no-cache`); ext*proc failure mode is \_closed* when the app has middleware.
 3. **Blue/green ordering.** Active Service selectors are patched only after every new pod is
-   verified serving on `/healthz`; the previous build is kept at 0 replicas; deploy state is
+   verified serving on `/healthz`; the previous build is kept at 0 replicas by default, or one
+   standby replica per pool with opt-in retention (see `docs/configuration.md`); deploy state is
    committed only after cutover. The selector value comes from the same sanitizer that stamps the
    pod label (a mismatch drains the Service to zero endpoints).
 4. **Parity with `next start`.** `routing-common.ts` helpers are pinned to empirically verified

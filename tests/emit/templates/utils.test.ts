@@ -171,12 +171,17 @@ describe("poolResourceNames (single source of truth for template-rendered names)
     // name helper stays: deploy/rollback still clean up policies older builds created, and
     // it must keep reproducing the 59-char truncation boundary exactly.
     expect(serviceDoc).not.toContain("kind: HealthCheckPolicy");
-    const [, activeHcpDoc, activePdbDoc] = renderActiveService({ poolName, releaseName }).split(
-      "---",
-    );
+    const [, activeHcpDoc, activeBcpDoc, activePdbDoc] = renderActiveService({
+      poolName,
+      releaseName,
+    }).split("---");
     expect(activeHcpDoc).toContain("kind: HealthCheckPolicy");
     expect(metadataName(activeHcpDoc!)).toBe(sanitizeK8sName(`${releaseName}-${poolName}`, "-hcp"));
     expect(activePdbDoc).toContain("kind: PodDisruptionBudget");
+    expect(activeBcpDoc).toContain("kind: GCPBackendPolicy");
+    expect(activeBcpDoc).toContain("drainingTimeoutSec: 60");
+    expect(activeBcpDoc).toMatch(/logging:\s+enabled: true\s+sampleRate: 1000000/);
+    expect(metadataName(activeBcpDoc!)).toBe(sanitizeK8sName(`${releaseName}-${poolName}`, "-bcp"));
     expect(names.hcp.length).toBeLessThanOrEqual(63);
 
     // The naive CLI reconstruction diverges — that is exactly what the helper prevents.

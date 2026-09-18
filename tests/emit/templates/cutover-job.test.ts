@@ -300,7 +300,7 @@ describe("renderCutoverRbac — namespace-scoped, verb-minimal", () => {
       // D6 warm-up patch, E5 delete, the revert path's `kubectl autoscale` create.
       "autoscaling/horizontalpodautoscalers": ["get", "list", "create", "patch", "delete"],
       // D7 lists pods and reads Ready; the diagnostics exec /readyz and read logs.
-      pods: ["get", "list"],
+      pods: ["get", "list", "patch"],
       "pods/exec": ["create"],
       "pods/log": ["get"],
       // D3 waits on the route-ext Job; E6 GCs superseded ones.
@@ -314,6 +314,7 @@ describe("renderCutoverRbac — namespace-scoped, verb-minimal", () => {
       // selects the pool it claims to, and deletes the obsolete ones.
       "policy/poddisruptionbudgets": ["get", "list", "delete"],
       "networking.gke.io/healthcheckpolicies": ["get", "list", "delete"],
+      "networking.gke.io/gcpbackendpolicies": ["get", "list", "delete"],
       // D4/D5 generation-guarded Accepted gate — read-only.
       "gateway.envoyproxy.io/envoyextensionpolicies": ["get"],
       // Composition-plan readiness — HTTPRoute/Gateway/Certificate/EndpointSlice.
@@ -338,8 +339,8 @@ describe("renderCutoverRbac — namespace-scoped, verb-minimal", () => {
     expect(rules.get("secrets")).not.toContain("create");
     expect(rules.get("secrets")).not.toContain("patch");
     expect(rules.get("secrets")).not.toContain("update");
-    // Pod exec is create-only on the subresource; pods themselves are read-only.
-    expect(rules.get("pods")).toEqual(["get", "list"]);
+    // Pod exec is create-only; GKE backend warm-up patches temporary pod labels.
+    expect(rules.get("pods")).toEqual(["get", "list", "patch"]);
   });
 
   it("grants E6's retained stable-resource sweep exactly what it executes", () => {

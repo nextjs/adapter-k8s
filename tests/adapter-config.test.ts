@@ -28,6 +28,15 @@ const validConfig: K8sAdapterConfig = {
 };
 
 describe("createK8sAdapter config normalization", () => {
+  it.each([undefined, true, false])(
+    "disables Next compression when configured as %s",
+    async (compress) => {
+      const adapter = createK8sAdapter(validConfig);
+      const modified = await adapter.modifyConfig!({ compress } as any, {} as any);
+      expect(modified).toMatchObject({ compress: false });
+    },
+  );
+
   it("rejects an unreviewed Next.js release before modifying the build config", async () => {
     const adapter = createK8sAdapter(validConfig);
 
@@ -656,6 +665,53 @@ describe("onBuildComplete build-time guards", () => {
     ).toContain("-routing-service.prod.svc.cluster.local");
   });
 
+  it("leaves one second for transport beyond the default GKE routing handler budget", async () => {
+    writeInfra({ projectId: "my-project-1", region: "us-central1" });
+    const adapter = createK8sAdapter(validConfig);
+    await adapter.modifyConfig!({} as any, {} as any);
+    await adapter.onBuildComplete!(ctx("b12345"));
+
+    const output = path.join(projectDir, ".k8s-adapter/output");
+    const chains = JSON.parse(readFileSync(path.join(output, "extension-chains.json"), "utf8"));
+    expect(chains[0].extensions[0].timeout).toBe("5s");
+    expect(
+      readFileSync(path.join(output, "chart/templates/routing-service-deployment.yaml"), "utf8"),
+    ).toMatch(/name: ROUTING_REQUEST_TIMEOUT_MS\s+value: "4000"/);
+  });
+
+  it.each([
+    { requestTimeoutMs: 4000, calloutSeconds: undefined, expected: "4s" },
+    { requestTimeoutMs: 2500, calloutSeconds: undefined, expected: "3s" },
+    { requestTimeoutMs: 0, calloutSeconds: undefined, expected: "1s" },
+    { requestTimeoutMs: undefined, calloutSeconds: 2.5, expected: "2.5s" },
+    { requestTimeoutMs: 1000, calloutSeconds: 2.5, expected: "2.5s" },
+  ])(
+    "preserves explicit GKE timeout settings $requestTimeoutMs/$calloutSeconds",
+    async ({ requestTimeoutMs, calloutSeconds, expected }) => {
+      writeInfra({ projectId: "my-project-1", region: "us-central1" });
+      const config = structuredClone(validConfig);
+      if (requestTimeoutMs !== undefined) config.routingService = { requestTimeoutMs };
+      if (calloutSeconds !== undefined) {
+        const gke = config.provider && "gke" in config.provider ? config.provider.gke : undefined;
+        gke!.serviceExtensions = { routeExtension: { timeout: calloutSeconds } };
+      }
+      const adapter = createK8sAdapter(config);
+      await adapter.modifyConfig!({} as any, {} as any);
+      await adapter.onBuildComplete!(ctx("b12345"));
+
+      const output = path.join(projectDir, ".k8s-adapter/output");
+      const chains = JSON.parse(readFileSync(path.join(output, "extension-chains.json"), "utf8"));
+      expect(chains[0].extensions[0].timeout).toBe(expected);
+      const deployment = readFileSync(
+        path.join(output, "chart/templates/routing-service-deployment.yaml"),
+        "utf8",
+      );
+      expect(deployment).toContain(
+        `name: ROUTING_REQUEST_TIMEOUT_MS\n              value: "${requestTimeoutMs ?? 4000}"`,
+      );
+    },
+  );
+
   it("uses the composed routing operation's project and resource names in emitted artifacts", async () => {
     writeInfra({
       namespace: "prod",
@@ -685,6 +741,10 @@ describe("onBuildComplete build-time guards", () => {
     expect(readFileSync(path.join(output, "extension-chains.json"), "utf8")).toContain(
       "projects/cluster-project/global/backendServices",
     );
+    expect(
+      JSON.parse(readFileSync(path.join(output, "extension-chains.json"), "utf8"))[0].extensions[0]
+        .timeout,
+    ).toBe("5s");
     expect(
       readFileSync(path.join(output, "chart/templates/route-ext-config.yaml"), "utf8"),
     ).toContain('name: "custom-traffic-ext"');

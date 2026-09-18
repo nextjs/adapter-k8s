@@ -350,7 +350,7 @@ describe("runRollback — state and CDN invalidation", () => {
 
     const mutationCalls = vi.mocked(execCapture).mock.calls.filter(([, args]) => {
       if (args[0] !== "patch") return false;
-      return args[1] === "service" || args[1] === "deployment";
+      return args[1] === "service" || args[2] === `${RELEASE}-routing-service`;
     });
     expect(mutationCalls).toHaveLength(0);
     expect(vi.mocked(writeState)).not.toHaveBeenCalled();
@@ -484,7 +484,12 @@ describe("runRollback — state and CDN invalidation", () => {
 
     const edgePatches = vi
       .mocked(execCapture)
-      .mock.calls.filter(([, args]) => args.includes("patch") && args.includes("deployment"))
+      .mock.calls.filter(
+        ([, args]) =>
+          args[0] === "patch" &&
+          args[1] === "deployment" &&
+          args[2] === `${RELEASE}-routing-service`,
+      )
       .map(([, args]) => args[args.length - 1] as string);
     expect(edgePatches).toHaveLength(2);
     expect(edgePatches[0]).toContain(`routing-service@${digestM}`);
@@ -1079,7 +1084,12 @@ describe("runRollback — routing service revert", () => {
     // 2. The routing Deployment was patched to the previous build's image + manifest.
     const deployPatch = vi
       .mocked(execCapture)
-      .mock.calls.find(([, args]) => args.includes("patch") && args.includes("deployment"));
+      .mock.calls.find(
+        ([, args]) =>
+          args[0] === "patch" &&
+          args[1] === "deployment" &&
+          args[2] === `${RELEASE}-routing-service`,
+      );
     expect(deployPatch).toBeDefined();
     const patchBody = deployPatch![1][deployPatch![1].length - 1]!;
     expect(patchBody).toContain(`"image":"${REGISTRY}/routing-service:buildm"`);
@@ -1119,7 +1129,12 @@ describe("runRollback — routing service revert", () => {
 
     const deployPatch = vi
       .mocked(execCapture)
-      .mock.calls.find(([, args]) => args.includes("patch") && args.includes("deployment"));
+      .mock.calls.find(
+        ([, args]) =>
+          args[0] === "patch" &&
+          args[1] === "deployment" &&
+          args[2] === `${RELEASE}-routing-service`,
+      );
     expect(deployPatch).toBeDefined();
     const patchBody = deployPatch![1][deployPatch![1].length - 1]!;
     expect(patchBody).toContain(`"image":"${REGISTRY}/routing-service:buildm"`);
@@ -1164,7 +1179,12 @@ describe("runRollback — routing service revert", () => {
 
     const deployPatch = vi
       .mocked(execCapture)
-      .mock.calls.find(([, args]) => args.includes("patch") && args.includes("deployment"))!;
+      .mock.calls.find(
+        ([, args]) =>
+          args[0] === "patch" &&
+          args[1] === "deployment" &&
+          args[2] === `${RELEASE}-routing-service`,
+      )!;
     expect(deployPatch[1].at(-1)).toContain('"kubernetes.io/arch":"arm64"');
     expect(vi.mocked(writeState)).toHaveBeenCalledWith(
       PROJECT,
@@ -1188,7 +1208,12 @@ describe("runRollback — routing service revert", () => {
     expect(
       vi
         .mocked(execCapture)
-        .mock.calls.some(([, args]) => args.includes("patch") && args.includes("deployment")),
+        .mock.calls.some(
+          ([, args]) =>
+            args[0] === "patch" &&
+            args[1] === "deployment" &&
+            args[2] === `${RELEASE}-routing-service`,
+        ),
     ).toBe(false);
     expect(vi.mocked(execCaptureStdin)).not.toHaveBeenCalled();
     expect(vi.mocked(writeState)).toHaveBeenCalled();
@@ -1279,7 +1304,11 @@ describe("runRollback — partial selector-patch failure rolls the edge forward"
         }
         return ok();
       }
-      if (args.includes("patch") && args.includes("deployment")) {
+      if (
+        args[0] === "patch" &&
+        args[1] === "deployment" &&
+        args[2] === `${RELEASE}-routing-service`
+      ) {
         const body = args[args.length - 1]!;
         if (opts.edgeForwardFails && body.includes("routing-service:buildn")) {
           return { exitCode: 1, stdout: "", stderr: "field manager conflict" };
@@ -1399,7 +1428,10 @@ describe("runRollback — partial selector-patch failure rolls the edge forward"
     );
     expect(edgeForwardIdx).toBeGreaterThan(svcRestoreIdx);
     const edgePatches = calls
-      .filter(([, a]) => a.includes("patch") && a.includes("deployment"))
+      .filter(
+        ([, a]) =>
+          a[0] === "patch" && a[1] === "deployment" && a[2] === `${RELEASE}-routing-service`,
+      )
       .map(([, a]) => a.at(-1)!);
     expect(edgePatches[0]).toContain('"kubernetes.io/arch":"amd64"');
     // The mocked live edge already carries arm64 on the second read.
@@ -1869,7 +1901,14 @@ describe("runRollback — serving gate", () => {
     await assertion;
 
     const calls = vi.mocked(execCapture).mock.calls.map(([, args]) => args);
-    expect(calls.some((a) => a.includes("patch"))).toBe(false);
+    expect(
+      calls.some(
+        (a) => a[0] === "patch" && (a[1] === "service" || a[2] === `${RELEASE}-routing-service`),
+      ),
+    ).toBe(false);
+    expect(
+      calls.some((a) => a[0] === "patch" && a.at(-1)?.includes("adapter-k8s.io/retention-expiry")),
+    ).toBe(true);
     expect(vi.mocked(writeState)).not.toHaveBeenCalled();
     expect(invalidateCdnBuildTag).not.toHaveBeenCalled();
   });
@@ -1982,6 +2021,16 @@ describe("runRollback — N26: scales the target to the current build's live cap
       vi.mocked(execOrThrow).mock.invocationCallOrder[
         vi.mocked(execOrThrow).mock.calls.indexOf(scale!)
       ]!;
+    const fenceIdx = vi
+      .mocked(execCapture)
+      .mock.calls.findIndex(
+        ([, a]) =>
+          a[0] === "patch" &&
+          a[2] === "rel-ssr-buildm" &&
+          a.at(-1)?.includes("adapter-k8s.io/retention-expiry"),
+      );
+    expect(fenceIdx).toBeGreaterThanOrEqual(0);
+    expect(vi.mocked(execCapture).mock.invocationCallOrder[fenceIdx]!).toBeLessThan(scaleOrder);
     const svcPatchIdx = vi
       .mocked(execCapture)
       .mock.calls.findIndex(([, a]) => a.includes("patch") && a.includes("service"));

@@ -77,7 +77,7 @@ function stubCluster(data: ClusterData): void {
     if (args.includes("backend-services") && args.includes("list")) return ok(data.bsList ?? "");
     if (has("value(loadBalancingScheme)")) return ok("EXTERNAL_MANAGED");
     if (has("value(backends)")) return ok("neg-group");
-    if (args.includes("health-checks")) return ok("TCP");
+    if (args.includes("health-checks")) return ok("HTTP");
     if (args.includes("certificates")) return ok("ACTIVE");
     if (args.includes("dns-authorizations"))
       return ok(data.dnsAuth ?? "_acme-challenge.app.example.com.\tCNAME\tabc123.");

@@ -295,7 +295,7 @@ export type DiagnosticSource =
       kind: "gcp-health-check-shape";
       projectId: string;
       name: string;
-      expectedType: "TCP";
+      expectedType: "TCP" | "HTTP";
     }
   | { kind: "gcp-certificate"; projectId: string; name: string };
 

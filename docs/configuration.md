@@ -142,13 +142,20 @@ Applies when the target hosts a routing tier (`envoyNativeRouting`, `gkeNativeRo
 routingService: {
   scaling: { min: 2, max: 10, targetCPU: 70 },
   resources: { cpu: '500m', memory: '512Mi', cpuLimit: '1000m', memoryLimit: '512Mi' },
-  requestTimeoutMs: 4000,
+  // Omit requestTimeoutMs to use the default handler and callout budgets.
   failureMode: 'auto',   // fails closed when the app has middleware (never bypass auth),
                          // fails open otherwise; 'open'/'closed' force it
 },
 ```
 
-`requestTimeoutMs` is the per-request handler budget in milliseconds; it must stay under the 5s ext_proc deadline.
+`requestTimeoutMs` is the per-request handler budget in milliseconds. When it is omitted,
+GKE uses a 4000ms handler budget and a 5s callout deadline, leaving one second for transport.
+Explicit settings keep their existing behavior: a configured handler budget derives a GKE
+callout deadline rounded up to whole seconds, with a minimum of 1s;
+`provider.gke.serviceExtensions.routeExtension.timeout` overrides that deadline in seconds.
+If you configure either timeout, leave room for transport between the handler budget and
+the callout deadline. Native Envoy's callout deadline is controlled separately by
+`envoyNativeRouting({ messageTimeoutMs })`.
 
 ## Multiple hosts & wildcards
 
@@ -241,6 +248,121 @@ entries are served without caching.
 
 For an external image optimization service, use Next's `images.loader: "custom"` and
 `images.loaderFile` to generate that service's URLs.
+
+## Middle cache for build assets
+
+Set `middleCache: { enabled: true }` in your adapter config to serve build assets through
+a Go sidecar. It works with every target and both container strategies. Middleware and
+proxy routing still run for every request, including cache hits, HEAD and conditional
+requests. The sidecar serves the resolved file and preserves the current request's
+response headers and cookies. Responses covered by middleware retain `Cache-Control:
+no-cache`, so an upstream CDN cannot skip middleware.
+
+The cache holds file bytes from `public/` and build-emitted static assets. It excludes
+prerenders, ISR/PPR, image optimization, dynamic responses and external proxy responses.
+Each pod caches at most 64 MiB and 4,096 files, with a 1 MiB limit per cached file. Larger
+files stream from disk. The sidecar admits at most 64 concurrent file responses and
+answers excess requests with an uncacheable 503. Cache entries belong to the pod's build;
+deploy and rollback switch the sidecar and app together through the existing Service.
+
+This option adds a Go process with a 128 MiB memory request and 256 MiB limit to each pool
+pod. It uses the same image as the pool, with a static Go binary compiled during the
+Docker build. The host does not need Go. Port 3000 remains the public pod port; the Node
+server listens on loopback port 3001. With compression enabled, Envoy owns port 3000
+and the middle cache listens on loopback port 3002. Readiness checks pass through both
+proxies to Node.
+Disable the option and rebuild to return to Node file serving. Local `emulate` continues
+to serve files through Node.
+
+## Response compression
+
+The deployment adapter overrides Next's `compress` setting to `false`, including when
+the app sets it to `true`. Generated pool pods run a separate Envoy process for response
+compression by default, on every target including GKE. Set `compression: { enabled: false }`
+in the adapter config to omit this proxy when your own ingress handles compression.
+Next compression remains disabled.
+
+Envoy negotiates Brotli, Zstandard and gzip from `Accept-Encoding`, honors client quality
+values, and prefers Brotli for ties. It compresses HTML, RSC, JSON, JavaScript, CSS, XML,
+SVG and WebAssembly. Responses with a known length below 1 KiB remain uncompressed.
+SSE, partial-range responses, already encoded bodies and responses with `Cache-Control:
+no-transform` pass through unchanged. Compression adds `Vary: Accept-Encoding`, preserves
+cookies and weak ETags, and removes strong ETags when transforming the body.
+
+Brotli and gzip flush incremental HTML/RSC chunks. Envoy 1.38.3's Zstandard compressor
+does not flush intermediate chunks, so the adapter skips Zstandard on responses without
+`Content-Length`. If negotiation selects Zstandard for such a response, Envoy sends it
+uncompressed. It never buffers a response to determine its length.
+
+The proxy preserves the request target, authority, forwarded headers and `Accept-Encoding`
+so middleware dispatch proofs remain valid. With the middle cache enabled, the response
+passes from Node through the asset cache and then through Envoy. The cache keeps original
+file bytes; compression does not cache response headers or skip middleware.
+
+Each pool pod gains a digest-pinned Envoy 1.38.3 container with two worker threads, a
+100m CPU and 64 MiB memory request, and limits of 1 CPU and 128 MiB. Port 3000 stays the
+public port and readiness checks traverse the proxy. Its shutdown hook waits for load
+balancer draining before draining active connections. Local `emulate` uses the same codecs
+in its existing front proxy.
+
+## Previous-build retention
+
+```js
+retention: { enabled: true, gracePeriodSeconds: 300 }
+```
+
+Retention is disabled by default. Enable it in two successive builds to keep an open
+tab's previously unrequested immutable chunks and pending Server Actions usable across
+promotion and rollback. The adapter supplies a unique Next deployment ID when the app
+does not configure one. Ordinary navigation still follows Next's recovery onto the
+current build.
+
+Only the immediately previous build is retained. Each of its pools keeps one replica,
+including its configured sidecars, with its HPA removed. After the serving deadline,
+a cluster CronJob scales those pools to zero and preserves their rollback resources.
+It checks once per minute; scheduling delays and the normal pod termination grace period
+can extend the time until the pods disappear. Rollback restores capacity and verifies
+readiness before moving traffic. Leave retention disabled to park the rollback target
+at zero immediately after cutover.
+
+The cleanup job uses the deployed default-pool image and a separate service account.
+Its namespace Role can read the release's deploy state, list Deployments, Services, and
+HPAs, and patch Deployment scale subresources. It cannot read Secrets or edit pod
+templates. The worker checks the release, build, serving selectors, deadline, and HPA
+ownership. Each scale-down requires the Deployment's observed UID and resource version
+to still match. Promotion and rollback renew that build's expiry marker before readiness,
+so cleanup cannot act on an older observation after the build is prepared to serve.
+
+Expiry markers have a one-hour recovery deadline during preparation. If the CLI exits
+after committing traffic but before finalizing retention, the job can still retire the
+standby later. It leaves capacity untouched when state or selectors disagree, API reads
+fail, or an HPA still controls the target. Recover an interrupted cutover or remove the
+outgoing HPA through a successful deploy/rollback before expecting cleanup in those cases.
+
+`gracePeriodSeconds` accepts integers from 1 to 3600 and defaults to 300. After successful
+cutover, the CLI publishes a signed serving deadline with an additional 120-second
+ConfigMap propagation allowance. A preparation record has a one-hour expiry so an
+interrupted promotion cannot leave public forwarding enabled indefinitely. A subsequent
+deployment can evict the older build before its deadline. After eviction or expiry,
+missing chunks and stale action IDs use the current build's normal error behavior;
+mutations are never automatically retried.
+
+The adapter matches only build-inventoried `/_next/static/immutable/` paths and Server
+Action IDs. It forwards the original request to the retained build without a trusted
+middleware verdict, so that build runs its own middleware and routing. Retained responses
+use `Cache-Control: no-store` to prevent them from populating the current build's CDN
+cache. Mutable public files, image optimization, ordinary API POSTs, and WebSocket
+connections are outside this policy. Non-hydrated form submissions without a
+`Next-Action` header are also outside it.
+
+Serialize deployments and rollbacks for a release. Both builds must have retention
+enabled and the same pool names. A topology change
+disables retention for that cutover and parks the previous build at zero replicas;
+retaining renamed pools requires additional NetworkPolicy support. Inventories are
+limited to 200 KB per build and the signed index to 800 KB. Deploy and rollback verify
+inventory signatures and wait for the index to reach ready pods before switching
+selectors. The old build must remain compatible with your shared data and services for
+the entire serving window.
 
 ## Not yet implemented
 

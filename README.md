@@ -28,6 +28,10 @@ data, and cached-navigation fallback params; see [Distributed cache](./docs/conf
 
 CDN and middleware behavior are coordinated so cached responses can never bypass middleware-protected routes—see [Architecture](#architecture) for how.
 
+For assets covered by middleware, opt into `middleCache: { enabled: true }`. A Go sidecar
+caches and serves build-file bytes after each request passes routing and middleware,
+preserving that request's headers and cookies. See [middle cache configuration](./docs/configuration.md#middle-cache-for-build-assets).
+
 ## Status
 
 This package is **not published to npm** and remains **experimental**. APIs and generated infrastructure may change before the first release. Claims are scoped to recorded evidence:

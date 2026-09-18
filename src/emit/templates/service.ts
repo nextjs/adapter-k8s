@@ -144,9 +144,40 @@ spec:
   targetRef:
     group: ""
     kind: Service
-    name: ${sanitizeK8sName(`${releaseName}-origin`)}`
+    name: ${sanitizeK8sName(`${releaseName}-origin`)}
+${renderBackendPolicy(releaseName, "origin")}`
     : ""
 }
+`;
+}
+
+/** GKE keeps established requests alive while NEG membership changes. */
+function renderBackendPolicy(releaseName: string, poolName: string): string {
+  const names = stablePoolResourceNames(releaseName, poolName);
+  return `---
+apiVersion: networking.gke.io/v1
+kind: GCPBackendPolicy
+metadata:
+  name: ${names.bcp}
+  annotations:
+    helm.sh/resource-policy: ""
+  labels:
+    app.kubernetes.io/name: "${releaseName}"
+    app.kubernetes.io/component: "${poolName}"
+spec:
+  default:
+    connectionDraining:
+      drainingTimeoutSec: 60
+    # A GCPBackendPolicy without logging disables the Gateway's default access logs.
+    # Preserve the controller's default 100% sampling while adding connection draining.
+    # https://docs.cloud.google.com/kubernetes-engine/docs/how-to/configure-gateway-resources
+    logging:
+      enabled: true
+      sampleRate: 1000000
+  targetRef:
+    group: ""
+    kind: Service
+    name: ${names.service}
 `;
 }
 
@@ -241,7 +272,8 @@ spec:
   targetRef:
     group: ""
     kind: Service
-    name: ${stableName}`
+    name: ${stableName}
+${renderBackendPolicy(releaseName, poolName)}`
     : ""
 }
 ---

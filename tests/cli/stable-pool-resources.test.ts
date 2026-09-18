@@ -13,7 +13,7 @@ const RELEASE = "rel";
 const NAMESPACE = "apps";
 
 function stableObject(
-  kind: "service" | "poddisruptionbudget" | "healthcheckpolicy",
+  kind: "service" | "poddisruptionbudget" | "healthcheckpolicy" | "gcpbackendpolicy",
   pool: string,
   opts: {
     legacyHcpLabels?: boolean;
@@ -24,7 +24,13 @@ function stableObject(
 ) {
   const base = `${RELEASE}-${pool}`;
   const name =
-    kind === "service" ? base : kind === "poddisruptionbudget" ? `${base}-pdb` : `${base}-hcp`;
+    kind === "service"
+      ? base
+      : kind === "poddisruptionbudget"
+        ? `${base}-pdb`
+        : kind === "gcpbackendpolicy"
+          ? `${base}-bcp`
+          : `${base}-hcp`;
   const labels: Record<string, string> = {
     "app.kubernetes.io/managed-by": opts.manager ?? "Helm",
     ...(opts.retained
@@ -97,7 +103,11 @@ describe("retainRemovedPoolResources", () => {
 
   it("atomically transfers Service, PDB, and legacy-unlabelled HCP identity", async () => {
     vi.mocked(execCapture).mockImplementation(async (_cmd, args) => {
-      const kind = args[1] as "service" | "poddisruptionbudget" | "healthcheckpolicy";
+      const kind = args[1] as
+        | "service"
+        | "poddisruptionbudget"
+        | "healthcheckpolicy"
+        | "gcpbackendpolicy";
       if (args[0] === "get") {
         return {
           exitCode: 0,
@@ -120,7 +130,7 @@ describe("retainRemovedPoolResources", () => {
         namespace: NAMESPACE,
         healthCheckPolicyCrd: true,
       }),
-    ).resolves.toEqual(["service", "poddisruptionbudget", "healthcheckpolicy"]);
+    ).resolves.toEqual(["service", "poddisruptionbudget", "healthcheckpolicy", "gcpbackendpolicy"]);
 
     const patches = vi
       .mocked(execCapture)
@@ -130,6 +140,7 @@ describe("retainRemovedPoolResources", () => {
       "service",
       "poddisruptionbudget",
       "healthcheckpolicy",
+      "gcpbackendpolicy",
     ]);
     for (const patch of patches) {
       expect(patch.body.metadata).toEqual({
@@ -227,7 +238,11 @@ describe("cleanupRetainedStablePoolResources", () => {
     const deleted: string[] = [];
     vi.mocked(execCapture).mockImplementation(async (_cmd, args) => {
       if (args[0] === "get") {
-        const kind = args[1] as "service" | "poddisruptionbudget" | "healthcheckpolicy";
+        const kind = args[1] as
+          | "service"
+          | "poddisruptionbudget"
+          | "healthcheckpolicy"
+          | "gcpbackendpolicy";
         return {
           exitCode: 0,
           stdout: JSON.stringify({
@@ -253,6 +268,7 @@ describe("cleanupRetainedStablePoolResources", () => {
     ).resolves.toEqual({
       deleted: [
         "healthcheckpolicy/rel-obsolete-hcp",
+        "gcpbackendpolicy/rel-obsolete-bcp",
         "poddisruptionbudget/rel-obsolete-pdb",
         "service/rel-obsolete",
       ],
@@ -260,6 +276,7 @@ describe("cleanupRetainedStablePoolResources", () => {
     });
     expect(deleted).toEqual([
       "healthcheckpolicy/rel-obsolete-hcp",
+      "gcpbackendpolicy/rel-obsolete-bcp",
       "poddisruptionbudget/rel-obsolete-pdb",
       "service/rel-obsolete",
     ]);

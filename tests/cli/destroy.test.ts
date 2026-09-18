@@ -76,6 +76,9 @@ describe("buildReleaseScopedGcpResources", () => {
     const healthCheck = resources.find((resource) => resource.desc.includes("health check"));
 
     expect(healthCheck?.args).toContain("my-app-routing-hc");
+    expect(resources.some((resource) => resource.args.includes("my-app-routing-ready-hc"))).toBe(
+      true,
+    );
     expect(healthCheck?.args).not.toContain("my-app-routing-tcp");
   });
 

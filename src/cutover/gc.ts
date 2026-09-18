@@ -1,3 +1,4 @@
+import { retentionName } from "../emit/templates/retention.js";
 // src/cutover/gc.ts
 // GitOps PR2: Phase E5/E6 — previous-build scale-down and superseded-resource GC, moved
 // verbatim from src/cli/deploy.ts steps 7f/7g; plus rollback's capacity planning
@@ -143,7 +144,7 @@ async function deleteOwnedVersionedCompanion(options: {
 }
 
 // 7f (E5). State is durable and traffic has switched, so it is now safe to scale the previous
-// build down to 0. It served through the rollout and remains as the rollback target.
+// build down to 0, or one standby replica with retention. It remains the rollback target.
 // Best-effort: success is already durable (7d) — a failure here warns instead of
 // failing the whole deploy (the previous build just keeps burning replicas until the
 // next deploy or a manual scale-down). The outgoing HPA was transferred out of Helm
@@ -157,8 +158,10 @@ export async function scaleDownPreviousBuild(opts: {
   buildId: string;
   previousBuildId: string | null;
   previousPools: string[];
+  replicas?: number;
 }): Promise<void> {
   const { releaseName, namespace, buildId, previousBuildId, previousPools } = opts;
+  const replicas = opts.replicas ?? 0;
   if (previousBuildId && previousBuildId !== buildId) {
     let scaleDownFailed = false;
     for (const poolName of previousPools) {
@@ -182,13 +185,13 @@ export async function scaleDownPreviousBuild(opts: {
         console.warn(
           `  ! Could not remove outgoing autoscaler ${poolPrevHpa}; leaving ` +
             `${poolPrevName} at its current replica count because that HPA could immediately ` +
-            `undo a scale to zero: ${sanitizeForTerminal(hpaDelete.stderr.trim()) || "unknown error"}`,
+            `undo the standby replica count: ${sanitizeForTerminal(hpaDelete.stderr.trim()) || "unknown error"}`,
         );
         continue;
       }
       const scaleDown = await execCapture(
         "kubectl",
-        ["scale", `deployment/${poolPrevName}`, "-n", namespace, "--replicas=0"],
+        ["scale", `deployment/${poolPrevName}`, "-n", namespace, `--replicas=${replicas}`],
         { timeoutMs: EXEC_TIMEOUTS.kubectl },
       );
       if (scaleDown.exitCode !== 0) {
@@ -201,17 +204,17 @@ export async function scaleDownPreviousBuild(opts: {
     }
     if (scaleDownFailed) {
       console.warn(
-        `  ! Previous build ${previousBuildId} was NOT fully scaled to 0 — it keeps its ` +
+        `  ! Previous build ${previousBuildId} was NOT fully scaled to ${replicas} — it keeps its ` +
           `replicas until the next deploy. Scale it down manually when convenient.`,
       );
     } else {
-      console.log(`  → Previous build scaled to 0 (kept for rollback)`);
+      console.log(`  → Previous build scaled to ${replicas} (kept for rollback)`);
     }
   }
 }
 
 // 7g (E6). Clean up old deployments and the retained/versioned objects nothing needs.
-// The previous build was scaled to 0 in step 7f above (kept as the rollback target).
+// Step 7f parks the previous build, with one replica per pool when retention is enabled.
 // Delete anything that isn't the current or previous build. Classify by EXACT deployment name
 // (reconstructed with the same sanitizer the template uses) rather than a 12-char normalized
 // substring — a shared prefix between two build ids could otherwise delete the wrong build.
@@ -431,6 +434,47 @@ export async function gcSupersededResources(opts: {
   // build, non-current snapshots can't be classified as safe to delete, so keep them.
   // Best-effort: state is already committed (7d), a failure here only leaks storage.
   if (previousBuildId) {
+    const inventoryList = await execCapture(
+      "kubectl",
+      [
+        "get",
+        "configmaps",
+        "-n",
+        namespace,
+        "-l",
+        `app.kubernetes.io/name=${releaseName},app.kubernetes.io/component=retained-build-inventory`,
+        "-o",
+        "json",
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
+    if (inventoryList.exitCode === 0 && inventoryList.stdout.trim()) {
+      try {
+        for (const object of JSON.parse(inventoryList.stdout).items ?? []) {
+          const inventory = JSON.parse(object.data?.["inventory.json"] ?? "null");
+          if (
+            !inventory?.buildId ||
+            inventory.buildId === buildId ||
+            inventory.buildId === previousBuildId
+          )
+            continue;
+          if (
+            object.metadata?.name !== retentionName(releaseName, inventory.buildId) ||
+            object.metadata?.labels?.["app.kubernetes.io/name"] !== releaseName
+          )
+            continue;
+          await execCapture(
+            "kubectl",
+            ["delete", "configmap", object.metadata.name, "-n", namespace],
+            { timeoutMs: EXEC_TIMEOUTS.kubectl },
+          );
+        }
+      } catch {
+        console.warn(
+          "  ! Could not verify old retention inventories; keeping them for a later cleanup",
+        );
+      }
+    }
     const keepSnapshots = new Set([
       routingManifestSnapshotName(releaseName, buildId),
       routingManifestSnapshotName(releaseName, previousBuildId),
@@ -743,6 +787,7 @@ export async function readLiveCapacity(
 export async function scaleDownCurrentBuild(opts: {
   namespace: string;
   currentDeploys: PoolDeploy[];
+  replicas?: number;
 }): Promise<void> {
   const { namespace, currentDeploys } = opts;
   for (const currentDeploy of currentDeploys) {
@@ -754,7 +799,13 @@ export async function scaleDownCurrentBuild(opts: {
     );
     await execOrThrow(
       "kubectl",
-      ["scale", `deployment/${currentDeploy.name}`, "-n", namespace, "--replicas=0"],
+      [
+        "scale",
+        `deployment/${currentDeploy.name}`,
+        "-n",
+        namespace,
+        `--replicas=${opts.replicas ?? 0}`,
+      ],
       { timeoutMs: EXEC_TIMEOUTS.kubectl },
     );
   }

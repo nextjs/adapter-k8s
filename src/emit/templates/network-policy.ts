@@ -159,8 +159,8 @@ export const GFE_PROXY_CIDRS = GKE_GFE_PROXY_CIDRS;
 
 /**
  * Health-check prober source ranges for GFE-based load balancers with zonal NEG
- * backends (both the Gateway's pool health checks and the `<release>-routing-hc` TCP
- * check on :8443 that init.ts creates). Pinned by tests (see N19).
+ * backends (both the Gateway's pool health checks and the `<release>-routing-ready-hc` HTTP
+ * check on :8081 that init.ts creates). Pinned by tests (see N19).
  */
 export const HEALTH_CHECK_PROBE_CIDRS = GKE_HEALTH_CHECK_PROBE_CIDRS;
 
@@ -299,7 +299,9 @@ ${labels}${ns}`;
 ${strictIngressFrom}
       ports:
         - protocol: TCP
-          port: 8443`
+          port: 8443
+        - protocol: TCP
+          port: 8081`
     : "";
 
   // Operator-supplied node/subnet range(s): kubelet probe traffic (N19). Required

@@ -187,10 +187,13 @@ describe("renderRoutingServiceDeployment — review findings", () => {
     expect(partial).toMatch(/limits:\n\s+cpu: "1"\n\s+memory: "512Mi"/);
   });
 
-  it("N63: preStop and grace match the measured ~90s NEG drain (was sleep 25 / grace 40)", () => {
+  it("withdraws readiness at the start of preStop and preserves legacy rollback drainage", () => {
     const yaml = renderRoutingServiceDeployment(base);
     // The old values contradicted this file's OWN comment measuring ~90s.
-    expect(yaml).toContain('command: ["/bin/sh", "-c", "sleep 120"]');
+    expect(yaml).toContain("http://127.0.0.1:8081/drain");
+    expect(yaml).toContain("Math.max(0, 120000 - (Date.now() - start))");
+    expect(yaml).toMatch(/name: ROUTING_DRAIN_DELAY_MS\n\s+value: "120000"/);
+    expect(yaml).toMatch(/livenessProbe:\n\s+httpGet:\n\s+path: \/healthz/);
     expect(yaml).toContain("terminationGracePeriodSeconds: 210");
     expect(yamlOnly(yaml)).not.toContain("sleep 25");
     expect(yamlOnly(yaml)).not.toContain("terminationGracePeriodSeconds: 40");
@@ -219,7 +222,7 @@ describe("renderRoutingServiceDeployment — review findings", () => {
     const yaml = renderRoutingServiceDeployment(base);
     expect(yamlOnly(yaml)).not.toMatch(/timeoutSeconds: 1$/m);
     expect(yaml).toMatch(
-      /startupProbe:\n\s+httpGet:\n\s+path: \/healthz\n\s+port: 8081\n\s+periodSeconds: 5\n\s+timeoutSeconds: 3\n\s+failureThreshold: 30/,
+      /startupProbe:\n\s+httpGet:\n\s+path: \/readyz\n\s+port: 8081\n\s+periodSeconds: 5\n\s+timeoutSeconds: 3\n\s+failureThreshold: 30/,
     );
     expect(yaml).toMatch(/readinessProbe:[\s\S]*?timeoutSeconds: 3/);
     expect(yaml).toMatch(/livenessProbe:[\s\S]*?timeoutSeconds: 5/);

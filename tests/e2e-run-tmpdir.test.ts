@@ -68,12 +68,33 @@ describe("E2E run temp directories", () => {
         "bash",
         [
           "-c",
-          'source "$1"; E2E_STOP_GRACE_TICKS=2; export E2E_STOP_GRACE_TICKS; bash -c \'trap "" TERM; while :; do sleep 30 & printf "%s" "$!" > "$1"; wait; done\' bash "$2" & parent=$!; while [ ! -s "$2" ]; do sleep 0.01; done; stop_e2e_children "$parent"; child="$(cat "$2")"; if kill -0 "$parent" 2>/dev/null || kill -0 "$child" 2>/dev/null; then printf alive; else printf stopped; fi',
+          `source "$1"
+          export E2E_STOP_GRACE_TICKS=2
+          bash -c 'trap "" TERM; while :; do sleep 30 & printf "%s" "$!" > "$1"; wait; done' bash "$2" &
+          parent=$!
+          child=""
+          trap 'kill -KILL "$parent" "$child" 2>/dev/null || true; wait "$parent" 2>/dev/null || true' EXIT
+          while [ ! -s "$2" ]; do sleep 0.01; done
+          child="$(cat "$2")"
+          stop_e2e_children "$parent"
+          child="$(cat "$2")"
+          is_running() {
+            local state
+            state="$(ps -o stat= -p "$1" 2>/dev/null)" || return 1
+            [[ -n "$state" && "$state" != *Z* ]]
+          }
+          # Orphaned zombies have exited but kill -0 succeeds until the host init reaps them.
+          # Allow signal delivery to finish, while still rejecting any live descendant.
+          for ((tick = 0; tick < 100; tick++)); do
+            if ! is_running "$parent" && ! is_running "$child"; then printf stopped; exit; fi
+            sleep 0.01
+          done
+          printf alive`,
           "bash",
           helper,
           childPidFile,
         ],
-        { encoding: "utf8" },
+        { encoding: "utf8", timeout: 10_000 },
       );
       expect(result).toBe("stopped");
     } finally {

@@ -308,6 +308,9 @@ async function main() {
   // Per-request budget: shed slow requests before the ext_proc deadline (default 4s,
   // under GCP's 5s callout timeout). Set 0 to disable.
   const timeoutMs = parseInt(process.env.ROUTING_REQUEST_TIMEOUT_MS ?? "4000", 10);
+  const drainDelayMs = Number(process.env.ROUTING_DRAIN_DELAY_MS ?? "0");
+  if (!Number.isSafeInteger(drainDelayMs) || drainDelayMs < 0 || drainDelayMs > 120_000)
+    throw new Error("Invalid ROUTING_DRAIN_DELAY_MS: expected 0..120000");
   const listenHost = process.env.ADAPTER_K8S_LISTEN_HOST;
 
   // Create handler and server. Mint the TLS identity first so createRoutingServer sees the
@@ -322,15 +325,30 @@ async function main() {
   // Real health endpoint (httpGet probe) — evicts a wedged/broken pod that a TCP
   // probe would leave in the NEG. Ready only once the ext_proc server is listening.
   let ready = instrumentationStatus !== "failed";
+  let drainStarted: number | undefined;
+  const beginDrain = () => {
+    if (drainStarted !== undefined) return;
+    drainStarted = performance.now();
+    ready = false;
+    console.log(`Routing readiness withdrawn; serving callouts for ${drainDelayMs}ms before drain`);
+  };
   const healthPort = parseInt(process.env.HEALTH_PORT ?? "8081", 10);
-  const health = startHealthServer(healthPort, () => ready, listenHost);
+  const health = await startHealthServer(healthPort, () => ready, listenHost, beginDrain);
 
   // Graceful shutdown
+  let shuttingDown = false;
   const shutdown = async () => {
-    console.log("Shutting down routing service...");
-    ready = false;
+    if (shuttingDown) return;
+    shuttingDown = true;
+    beginDrain();
+    // Keep HTTP readiness observable as 503 while the data listener still serves.
+    // A preStop sleep kept both TCP health and readiness green until listener close,
+    // producing a 33s ext_proc failure window on the 2026-09-18 GKE rollout.
+    await server.stop({
+      delayMs: Math.max(0, Math.ceil(drainDelayMs - (performance.now() - drainStarted!))),
+    });
     await health.close().catch(() => {});
-    await server.stop();
+    console.log("Routing service drain complete");
     process.exit(0);
   };
   process.on("SIGTERM", shutdown);
