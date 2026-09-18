@@ -206,6 +206,18 @@ The specific behaviors the architecture exists to get right, each confirmed agai
   500s and nineteen 504s over 33 seconds coincided with the last old routing pod shutting
   down. Load-balancer logs identified ext_proc `UNAVAILABLE` and `DEADLINE_EXCEEDED`,
   before cleanup changed any replica counts. Zero-error deployment remains unproven.
+- **Routing readiness withdrawal on live GKE.** A follow-up on September 18, 2026
+  deployed two updated builds and rolled back under 51,126 normal requests and 9,426
+  middleware-denial requests. GKE reported the outgoing routing endpoints unhealthy
+  13–20 seconds after readiness
+  withdrawal; all four updated outgoing pods finished draining at 120 seconds without
+  forced teardown. The initial migration had no probe failures. The next deployment
+  produced four HTTP 504s, and rollback produced one, all confirmed as ext_proc
+  `DEADLINE_EXCEEDED`. All five occurred on the one-request-per-second keep-alive lane;
+  the faster request lanes and middleware-denial probes stayed clean. The rollback
+  timeout preceded routing readiness withdrawal, so pod shutdown alone does not explain
+  the remaining failures. Both updated builds and the restored build passed all 30 live
+  checks. Zero-error cutover is still unresolved.
 - **Full-topology runs are operator-initiated, not per-commit CI.** The cluster-topology
   suite (layer 2) covers the ext_proc path end to end, but it runs on a local k3d cluster
   when a maintainer launches it—hours, not minutes. Pull requests are gated by the unit,
