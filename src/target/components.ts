@@ -1393,6 +1393,12 @@ export function gkeNativeRouting(
             name: `${context.releaseName}-routing-hc`,
             scope: "global",
           },
+          {
+            kind: "gcp-health-check",
+            projectId,
+            name: `${context.releaseName}-routing-ready-hc`,
+            scope: "global",
+          },
           { kind: "gcp-global-address", projectId, name: addressName },
         ],
         diagnostics: [
@@ -1413,8 +1419,8 @@ export function gkeNativeRouting(
           {
             kind: "gcp-health-check-shape",
             projectId,
-            name: `${context.releaseName}-routing-hc`,
-            expectedType: "TCP",
+            name: `${context.releaseName}-routing-ready-hc`,
+            expectedType: "HTTP",
           },
         ],
       };

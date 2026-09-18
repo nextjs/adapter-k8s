@@ -104,8 +104,12 @@ describe("buildInitGcloudCommands", () => {
 
     const hcCmd = commands.find((c) => c.description.includes("health check for routing"));
     expect(hcCmd).toBeDefined();
-    // TCP, not gRPC: a plaintext gRPC health check fails against the TLS ext_proc server.
-    expect(hcCmd!.args).toContain("tcp");
+    // Probe readiness before the TLS listener closes during drain.
+    expect(hcCmd!.args).toContain("http");
+    expect(hcCmd!.args).toContain("8081");
+    expect(hcCmd!.args).toContain("/readyz");
+    expect(hcCmd!.args).toContain("my-app-routing-ready-hc");
+    expect(backendCmd!.args).toContain("--connection-draining-timeout=60");
     expect(hcCmd!.args).not.toContain("grpc");
 
     // LbRouteExtension is created via Helm hook `import`, not during init

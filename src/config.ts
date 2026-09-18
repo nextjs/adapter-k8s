@@ -65,6 +65,7 @@ const MIN_SURVIVING_BUILD_ID_CHARS = 8;
 // the pool reports as its build and what namespaces its Valkey entries (`k8s:<buildId>:`), so
 // overriding it would silently cross-wire two builds' caches.
 const RESERVED_ENV_NAMES = new Set([
+  "ROUTING_DRAIN_DELAY_MS",
   "NODE_ENV",
   "NEXT_BUILD_ID",
   "POOL_NAME",

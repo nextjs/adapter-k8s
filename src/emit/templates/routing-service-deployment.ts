@@ -219,12 +219,9 @@ ${pullSecretsBlock}      nodeSelector:
         fsGroup: 1000
         seccompProfile:
           type: RuntimeDefault
-      # N63. Give a terminating pod time to keep serving in-flight callouts while the LB
-      # stops routing to it (preStop below), before SIGTERM/kill. Was 25s/40s while the
-      # comment above measured a ~90s NEG sync — the value contradicted the measurement.
-      # Now matched to Google's guidance for NEG-backed pods ("Troubleshoot load balancing
-      # in GKE": preStop sleep 120, terminationGracePeriodSeconds 3.5 minutes), which is
-      # also comfortably above the observed drain.
+      # Withdraw readiness at the START of preStop, then keep serving while the LB
+      # removes this endpoint. The hook also works with retained older images: their
+      # health server returns 404 for /drain, leaving the original sleep in effect.
       terminationGracePeriodSeconds: ${TERMINATION_GRACE_SECONDS}
       # N65. The tier defaults to 2 replicas that the scheduler is free to co-locate, and
       # the callout is fail-CLOSED whenever the app has middleware — losing both replicas
@@ -249,10 +246,15 @@ ${pullSecretsBlock}      nodeSelector:
               drop: ["ALL"]
           lifecycle:
             preStop:
-              # Keep serving while GCP reprograms the NEG to drain this terminating pod.
-              # Without this, in-flight ext_proc callouts land on a pod that's already gone.
               exec:
-                command: ["/bin/sh", "-c", "sleep ${PRESTOP_DRAIN_SECONDS}"]
+                command:
+                  - node
+                  - -e
+                  - >-
+                    const start = Date.now();
+                    fetch('http://127.0.0.1:8081/drain', {method: 'POST', signal: AbortSignal.timeout(2000)})
+                    .catch(error => console.error('Readiness withdrawal failed:', error.message))
+                    .finally(() => setTimeout(() => {}, Math.max(0, ${PRESTOP_DRAIN_SECONDS * 1000} - (Date.now() - start))));
           ports:
             - containerPort: 8443
               name: grpc
@@ -271,6 +273,8 @@ ${pullSecretsBlock}      nodeSelector:
               value: "${transport}"${tlsIdentityEnv}
             - name: ROUTING_FAIL_OPEN
               value: "${failOpen === false ? "false" : "true"}"
+            - name: ROUTING_DRAIN_DELAY_MS
+              value: "${PRESTOP_DRAIN_SECONDS * 1000}"
             - name: ROUTING_REQUEST_TIMEOUT_MS
               value: "${requestTimeoutMs ?? 4000}"
             - name: CONFIG_DIR
@@ -297,14 +301,14 @@ ${retention ? retentionMount : ""}            - name: routing-manifest
           # gets evicted from the NEG instead of silently failing callouts.
           startupProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: 8081
             periodSeconds: ${STARTUP_PROBE_PERIOD_SECONDS}
             timeoutSeconds: 3
             failureThreshold: ${STARTUP_PROBE_FAILURE_THRESHOLD}
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: 8081
             initialDelaySeconds: 3
             periodSeconds: ${READINESS_PROBE_PERIOD_SECONDS}
