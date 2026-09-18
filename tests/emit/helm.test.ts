@@ -1,3 +1,4 @@
+import { retentionName } from "../../src/emit/templates/retention.js";
 // tests/emit/helm.test.ts
 import { describe, it, expect } from "vitest";
 import {
@@ -1001,4 +1002,11 @@ describe("S25: secret-bearing templates are all mode-gated", () => {
   it("ignores non-template chart files", () => {
     expect(() => assertSecretChartFilesComplete({ "values.yaml": "kind: Secret\n" })).not.toThrow();
   });
+});
+
+it("keeps retention index and inventory names distinct for valid build IDs and long releases", () => {
+  expect(retentionName("rel", "index")).not.toBe(retentionName("rel"));
+  const prefix = "a".repeat(37);
+  expect(retentionName(prefix + "one")).not.toBe(retentionName(prefix + "two"));
+  expect(retentionName(prefix + "one", "build").length).toBeLessThanOrEqual(63);
 });

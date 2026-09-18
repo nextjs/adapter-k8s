@@ -1,3 +1,4 @@
+import { renderRetentionInventory } from "./emit/templates/retention.js";
 // src/adapter.ts
 import {
   writeFile,
@@ -1076,6 +1077,9 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         // Response compression belongs in the proxy, outside the Node runtime.
         // Override the app's value through the deployment adapter hook too.
         compress: false,
+        ...(cfg.retention?.enabled && !nextConfig.deploymentId
+          ? { deploymentId: `b${Date.now().toString(36)}${randomBytes(6).toString("hex")}` }
+          : {}),
         // Set turbopack root to the project directory to avoid workspace detection issues
         // when the adapter is loaded from outside the project tree (e.g., e2e tests)
         turbopack: {
@@ -1745,6 +1749,43 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         // Deployments reference the mutable build-id tag with `imagePullPolicy: Always`,
         // which is the mitigation for a retag.
       });
+
+      if (cfg.retention?.enabled) {
+        const referencesPath = path.join(distDir, "server/server-reference-manifest.json");
+        const references = existsSync(referencesPath)
+          ? JSON.parse(readFileSync(referencesPath, "utf8"))
+          : {};
+        const inventory = {
+          buildId,
+          deploymentId: deploymentId ?? "",
+          defaultPool: configuredDefaultPool,
+          pools: [...pools.keys()],
+          gracePeriodSeconds: cfg.retention.gracePeriodSeconds ?? 300,
+          responseHeadTimeoutMs: Math.max(
+            60_000,
+            ...Object.values(routingManifest.poolResponseHeadTimeouts ?? {}),
+          ),
+          assets: staticManifest
+            .filter((a) => !a.prerender && a.pathname.includes("/_next/static/immutable/"))
+            .map((a) => a.pathname),
+          actions: [
+            ...new Set([
+              ...Object.keys(references.node ?? {}),
+              ...Object.keys(references.edge ?? {}),
+            ]),
+          ],
+        };
+        helmFiles["templates/retained-build-inventory.yaml"] = renderRetentionInventory(
+          releaseName,
+          inventory,
+          await deriveInternalSecret(projectDir, releaseName, buildId),
+        );
+        await writeOutputFile(
+          projectDir,
+          "retained-build-inventory.json",
+          JSON.stringify(inventory),
+        );
+      }
 
       if (compiledTarget) {
         await writeOutputFile(

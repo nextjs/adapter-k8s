@@ -4,6 +4,8 @@ import { createK8sAdapter } from "@next-community/adapter-k8s";
 // provisioned). CDN is enabled here to validate the GCPHTTPFilter path on real
 // infrastructure — the running rev-24 deployment predates that feature.
 export default createK8sAdapter({
+  // Keep the serving window short enough for live expiry checks.
+  retention: { enabled: true, gracePeriodSeconds: 120 },
   middleCache: { enabled: true },
   pools: {
     default: {

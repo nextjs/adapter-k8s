@@ -88,7 +88,7 @@ export async function chromium() {
       }
     >();
     const failures: { type: string; url?: string; status?: number; message?: string }[] = [];
-    const requests: { type: string; url: string; method: string }[] = [];
+    const requests: { type: string; url: string; method: string; deploymentId?: string }[] = [];
     socket.addEventListener("close", () => {
       for (const request of pending.values()) {
         clearTimeout(request.timer);
@@ -107,7 +107,12 @@ export async function chromium() {
         else request.resolve(message.result);
       } else if (message.method === "Network.requestWillBeSent" && requests.length < 500) {
         const { type, request } = message.params;
-        requests.push({ type, url: request.url, method: request.method });
+        requests.push({
+          type,
+          url: request.url,
+          method: request.method,
+          deploymentId: request.headers["x-deployment-id"],
+        });
       } else if (failures.length < 100) {
         if (message.method === "Runtime.exceptionThrown") {
           const detail = message.params.exceptionDetails;

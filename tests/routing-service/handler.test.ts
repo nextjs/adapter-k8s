@@ -1,5 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { create } from "@bufbuild/protobuf";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { signRetention } from "../../src/retention.js";
 import { createRequestHandler } from "../../src/routing-service/handler.js";
 import { createProcessHandler, plainResponseToProto } from "../../src/routing-service/server.js";
 import {
@@ -119,6 +123,58 @@ function verifyAsPool(
 describe("createRequestHandler", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  it("hands a retained asset to full pool resolution without a middleware skip proof", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "retention-routing-"));
+    const previousFile = process.env.ADAPTER_K8S_RETENTION_FILE;
+    const previousSecret = process.env.INTERNAL_HEADER_SECRET;
+    try {
+      process.env.ADAPTER_K8S_RETENTION_FILE = path.join(root, "index.json");
+      process.env.INTERNAL_HEADER_SECRET = "test-secret";
+      const common = {
+        defaultPool: "ssr",
+        pools: ["ssr"],
+        gracePeriodSeconds: 300,
+        origin: "http://retained:3000",
+        actions: [],
+        expiresAt: Date.now() + 60_000,
+      };
+      const builds = [
+        { ...common, buildId: "test123", deploymentId: "test123", assets: [] },
+        {
+          ...common,
+          buildId: "previous",
+          deploymentId: "previous",
+          assets: ["/_next/static/immutable/chunks/old.js"],
+        },
+      ];
+      writeFileSync(
+        process.env.ADAPTER_K8S_RETENTION_FILE,
+        JSON.stringify({ test123: signRetention(builds, "test-secret") }),
+      );
+      const result = await createRequestHandler(
+        makeManifest(),
+        null,
+      )([
+        ...makeHeaders("/_next/static/immutable/chunks/old.js"),
+        { key: "x-upstream-pool", value: "api" },
+        { key: "x-mw-evaluated", value: "skip-nomatch" },
+      ]);
+      expect(result.requestHeaders?.response?.clearRouteCache).toBe(true);
+      const mutation = result.requestHeaders!.response!.headerMutation!;
+      expect(mutation.setHeaders).toEqual([]);
+      expect(mutation.removeHeaders).toContain(INTERNAL_DISPATCH_PROOF_HEADER);
+      expect(mutation.removeHeaders).toContain("x-mw-evaluated");
+      expect(mutation.removeHeaders).toContain("x-upstream-pool");
+      expect(resolveRoutes).not.toHaveBeenCalled();
+    } finally {
+      if (previousFile === undefined) delete process.env.ADAPTER_K8S_RETENTION_FILE;
+      else process.env.ADAPTER_K8S_RETENTION_FILE = previousFile;
+      if (previousSecret === undefined) delete process.env.INTERNAL_HEADER_SECRET;
+      else process.env.INTERNAL_HEADER_SECRET = previousSecret;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("returns header mutations for a normal route", async () => {

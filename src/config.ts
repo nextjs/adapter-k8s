@@ -72,6 +72,7 @@ const RESERVED_ENV_NAMES = new Set([
   "ADAPTER_K8S_PROVIDER_NAME",
   "ADAPTER_K8S_LISTEN_HOST",
   "ADAPTER_K8S_MIDDLE_CACHE",
+  "ADAPTER_K8S_RETENTION_FILE",
   "INTERNAL_HEADER_SECRET",
   "VALKEY_URL",
   "VALKEY_AUTH",
@@ -200,6 +201,21 @@ export function validateConfig(input: unknown, releaseName?: string): void {
       typeof config.middleCache.enabled !== "boolean")
   ) {
     throw new Error("middleCache must be an object with a boolean enabled field");
+  }
+  if (
+    config.retention !== undefined &&
+    (!config.retention ||
+      typeof config.retention !== "object" ||
+      Array.isArray(config.retention) ||
+      typeof config.retention.enabled !== "boolean" ||
+      (config.retention.gracePeriodSeconds !== undefined &&
+        (!Number.isInteger(config.retention.gracePeriodSeconds) ||
+          config.retention.gracePeriodSeconds < 1 ||
+          config.retention.gracePeriodSeconds > 3600)))
+  ) {
+    throw new Error(
+      "retention requires enabled and gracePeriodSeconds must be an integer from 1 to 3600",
+    );
   }
   for (const removed of ["imageOptimizer", "skewProtection", "routeExtension"] as const) {
     if (Object.hasOwn(inputRecord, removed) && inputRecord[removed] !== undefined) {

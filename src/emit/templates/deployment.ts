@@ -1,3 +1,4 @@
+import { retentionEnv, retentionMount, retentionVolume } from "./retention.js";
 // src/emit/templates/deployment.ts
 import path from "node:path";
 import {
@@ -122,6 +123,7 @@ export function renderDeployment({
   env,
   envFrom,
   deploymentId,
+  retention = false,
   providerName,
   nodeArchitecture = "amd64",
   pullSecrets,
@@ -171,6 +173,7 @@ export function renderDeployment({
    * pod must carry the exact build-time value.
    */
   deploymentId?: string;
+  retention?: boolean;
   /** Routing target component stamped onto adapter-owned OTEL signals. */
   providerName?: string;
   /** Literal architecture for this newly emitted build. */
@@ -506,9 +509,9 @@ ${pullSecretsBlock}${nodeSelector}      securityContext:
             # can't reach sibling pools in any release not named that.
             - name: RELEASE_NAME
               value: "${releaseName}"
-${internalSecretEnv}${valkeyEnv}${deploymentIdEnv}${providerNameEnv}${middleCacheEnv}${userEnv}${userEnvFrom}
+${retention ? retentionEnv : ""}${internalSecretEnv}${valkeyEnv}${deploymentIdEnv}${providerNameEnv}${middleCacheEnv}${userEnv}${userEnvFrom}
           volumeMounts:
-            # readOnlyRootFilesystem makes / read-only; Next still needs a writable
+${retention ? retentionMount : ""}            # readOnlyRootFilesystem makes / read-only; Next still needs a writable
             # scratch dir, so /tmp is an emptyDir. NOT in-memory: a bare \`emptyDir: {}\`
             # is backed by the NODE's disk (an in-memory one needs \`medium: Memory\`,
             # which would charge the pages to the container's memory limit) — the comment
@@ -564,7 +567,7 @@ ${internalSecretEnv}${valkeyEnv}${deploymentIdEnv}${providerNameEnv}${middleCach
               cpu: "${cpuLimit}"
               memory: "${memoryLimit}"
 ${middleCacheContainer}${compressionContainer}      volumes:
-        - name: tmp
+${retention ? retentionVolume(releaseName) : ""}        - name: tmp
           emptyDir:
             sizeLimit: ${TMP_SIZE_LIMIT}
         - name: next-cache

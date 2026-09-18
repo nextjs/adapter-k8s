@@ -181,9 +181,20 @@ The specific behaviors the architecture exists to get right, each confirmed agai
   current build, and current-build Server Actions worked. Previously unrequested lazy
   chunks returned 404 with `ChunkLoadError`; stale Server Action IDs returned 404 with
   `UnrecognizedActionError`. The comparison produced the same results with explicit
-  per-build deployment IDs. Neither failure automatically recovered. The opt-in browser
-  suite below remains red for these gaps. This comparison switches a loopback proxy
+  per-build deployment IDs. Neither failure automatically recovered. Enabling previous-build
+  retention now passes navigation, cold-chunk, stale-action, and current-action browser
+  checks in both cutover directions. The baseline without retention remains red.
+  This comparison switches a loopback proxy
   between production builds; it does not verify Kubernetes, Envoy, or CDN behavior.
+- **Previous-build retention on live GKE.** A three-build run on September 17, 2026
+  exercised promotion, rollback, and superseded-build cleanup with middleware, the middle
+  cache, Envoy compression, and Cloud CDN enabled. All 61,824 continuous public probes
+  succeeded. Old tabs loaded cold chunks and ran actions once; middleware denied retained
+  requests; both shared and changed action IDs reached the correct build. After expiry,
+  an old chunk and an unknown action ID returned 404 without mutation replay. The final
+  fixture passed all 30 live checks and all 33 doctor checks. The load-balancer error
+  query returned no 5xx entries. This covers one pool and successful cloud operations;
+  standby capacity remained one replica after expiry, as documented.
 - **Full-topology runs are operator-initiated, not per-commit CI.** The cluster-topology
   suite (layer 2) covers the ext_proc path end to end, but it runs on a local k3d cluster
   when a maintainer launches it—hours, not minutes. Pull requests are gated by the unit,
@@ -232,6 +243,13 @@ streaming, range exclusions, response metadata and signed dispatch headers.
 ```sh
 E2E_CONTINUITY_NEXT_VERSION=16.3.4 npm run test:e2e:continuity
 ```
+
+Add `E2E_CONTINUITY_RETENTION=1` to build both fixtures with retention enabled and run
+the four adapter browser checks. This mode creates a signed local retention index and
+tests the real forwarding path; it does not run the Kubernetes publication procedure.
+Hermetic HTTP tests separately check middleware denial, index tampering, expiry, cookie
+preservation, concurrent reads, and no mutation replay after a reset. Cutover tests check
+publication order, signatures, and standby capacity against a scripted cluster.
 
 This maintainer command builds and packs the adapter once, installs the pinned Next
 version into two temporary copies of `fixtures/main`, and builds them with distinct
