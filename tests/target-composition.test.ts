@@ -109,6 +109,86 @@ function nginxTelemetrySource(
 }
 
 describe("Kubernetes target composition", () => {
+  describe.each(["owned", "shared"] as const)("%s Gateway request timeouts", (kind) => {
+    function exposure(requestTimeout?: string) {
+      const options = { className: "eg", hosts, ingressSources: envoySources, requestTimeout };
+      return kind === "owned"
+        ? gatewayApiExposure(options)
+        : httpRouteExposure({ ...options, parentRefs: [{ name: "shared", namespace: "network" }] });
+    }
+
+    function compile(requestTimeout?: string, native = false) {
+      return compileTarget(
+        defineTarget({
+          cluster: kubernetesCluster(),
+          exposure: exposure(requestTimeout),
+          routing: native ? envoyNativeRouting({ escapedSlashes: "external" }) : portableRouting(),
+        }),
+        context(),
+      );
+    }
+
+    it.each([false, true])("preserves routing and backends with native=%s", (native) => {
+      const baseline = compile(undefined, native);
+      const streaming = compile("0s", native);
+      const route = (compiled: ReturnType<typeof compile>) =>
+        compiled.plan.operations.resources.objects.find((object) => object.kind === "HTTPRoute")!;
+      const before = route(baseline).body.spec as { rules: Record<string, unknown>[] };
+      const after = route(streaming).body.spec as { rules: Record<string, unknown>[] };
+      expect(before.rules[0]).not.toHaveProperty("timeouts");
+      expect(after.rules).toEqual(
+        before.rules.map((rule) => ({ ...rule, timeouts: { request: "0s" } })),
+      );
+      expect(streaming.plan.operations.routing).toEqual(baseline.plan.operations.routing);
+      expect(streaming.plan.target.fingerprint).not.toBe(baseline.plan.target.fingerprint);
+    });
+
+    it.each(["1ms", "30s", "1h30m", "1h2m3s4ms", "99999h", "0ms"])(
+      "accepts Gateway API duration %s",
+      (duration) => {
+        const compiled = compile(duration);
+        expect(compiled.plan.operations.resources.objects).toContainEqual(
+          expect.objectContaining({
+            kind: "HTTPRoute",
+            body: expect.objectContaining({
+              spec: expect.objectContaining({
+                rules: [expect.objectContaining({ timeouts: { request: duration } })],
+              }),
+            }),
+          }),
+        );
+      },
+    );
+
+    it("captures the validated timeout before the caller can mutate its options", () => {
+      const options = {
+        className: "eg",
+        hosts,
+        ingressSources: envoySources,
+        requestTimeout: "0s",
+      };
+      const sharedOptions = { ...options, parentRefs: [{ name: "shared", namespace: "network" }] };
+      const component =
+        kind === "owned" ? gatewayApiExposure(options) : httpRouteExposure(sharedOptions);
+      options.requestTimeout = sharedOptions.requestTimeout = "invalid";
+      const compiled = compileTarget(
+        defineTarget({ cluster: kubernetesCluster(), exposure: component }),
+        context(),
+      );
+      const route = compiled.plan.operations.resources.objects.find(
+        (object) => object.kind === "HTTPRoute",
+      )!;
+      expect(route.body.spec).toMatchObject({ rules: [{ timeouts: { request: "0s" } }] });
+    });
+
+    it.each(["", "-1s", "0.5s", "1d", "1us", "100000s", "1s1s1s1s1s", "1s\n", " 1s", 0, null])(
+      "rejects invalid request timeout %j before emission",
+      (duration) => {
+        expect(() => exposure(duration as string)).toThrow(/requestTimeout.*Gateway API duration/);
+      },
+    );
+  });
+
   it("rejects invalid GCP routing registration resource names at build time", () => {
     const target = defineTarget({
       cluster: gkeCluster({ projectId: "sample-project", region: "us-central1" }),
@@ -329,6 +409,7 @@ describe("Kubernetes target composition", () => {
           className: "eg",
           hosts: tlsHosts,
           certManager: { issuerRef: { name: "letsencrypt-production", kind: "ClusterIssuer" } },
+          requestTimeout: "0s",
         }),
       }),
       context(),
@@ -355,6 +436,15 @@ describe("Kubernetes target composition", () => {
     expect(JSON.stringify(gateway?.body)).toContain(
       '"certificateRefs":[{"kind":"Secret","name":"test-app-tls"}]',
     );
+    const routes = compiled.plan.operations.resources.objects.filter(
+      (object) => object.kind === "HTTPRoute",
+    );
+    expect(routes).toHaveLength(2);
+    const redirect = routes.find((route) => route.metadata.name === "test-app-http-redirect")!;
+    expect(redirect.body.spec).toMatchObject({
+      rules: [{ filters: [{ type: "RequestRedirect" }] }],
+    });
+    expect(JSON.stringify(redirect.body)).not.toContain("timeouts");
     // The cert-manager CRD joins preflight requirements; Certificate Ready joins readiness.
     expect(compiled.plan.requirements.kubernetes.resources).toContainEqual({
       apiVersion: "cert-manager.io/v1",

@@ -107,12 +107,15 @@ gatewayApiExposure({
   controllerManagedCertificate: { annotation: 'networking.gke.io/certmap', nameSuffix: '-certmap' },
   annotations: {},
   addresses: [{ type: 'IPAddress', value: '1.2.3.4' }],
+  requestTimeout: '0s',          // optional; whole-response limit, omitted uses controller default
   releaseAddresses: [{ type: 'NamedAddress', nameSuffix: '-ip' }],
   ingressSources: { cidrs: [], podSelectors: [{ namespace: 'envoy-gateway-system', labels: {...} }] },
 })
 ```
 
 Cannot mix TLS and plaintext hosts. Emits Gateway + HTTPRoute (+ HTTP→HTTPS redirect when TLS) and waits for `Programmed`/`Accepted`.
+
+`requestTimeout` requires Gateway API request-timeout support. It applies to the application route, with either portable or native routing. Use `"0s"` for long streams through Envoy or a finite Gateway API duration such as `"30s"`. Idle limits and configured route `maxDuration` still apply. The redirect-only route is unchanged.
 
 Either dedicated exposure can issue its own certificate instead of referencing one: top-level `certManager: { issuerRef: { name, kind: 'ClusterIssuer' | 'Issuer', group? } }` emits a `cert-manager.io/v1 Certificate` (secretName = `tlsSecretName` or a derived `<release>-tls`), declares the CRD requirement, and gates readiness on its `Ready` condition. Mutually exclusive with `controllerManagedTls`.
 
@@ -124,6 +127,7 @@ httpRouteExposure({
   parentRefs: [{ name: "envoy-external", namespace: "network" }], // required, >= 1; sectionName optional
   hosts: [{ hostname: "app.example.com", tls: { enabled: true } }],
   escapedSlashes: "external", // only accepted value; attestation that the parent owns the policy
+  requestTimeout: "0s", // optional; same duration and controller-support requirements as above
   annotations: {},
   ingressSources: {
     podSelectors: [{ namespace: "network", labels: { "app.kubernetes.io/name": "envoy" } }],
