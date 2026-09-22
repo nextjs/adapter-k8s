@@ -114,6 +114,19 @@ crash, exhausted grace period, or abrupt load-balancer reset can still break a c
 EOF/1001. Application-level IDs, idempotency, replay, and reconnect logic are what make those
 failures recoverable.
 
+### Retaining resources during an acceptance exercise
+
+`deploy --skip-cleanup` keeps outgoing build capacity, its autoscalers, superseded
+build resources and retired managed-cache resources after a successful cutover.
+`rollback --skip-cleanup` likewise leaves the rolled-away build running. Readiness,
+traffic switching and state commits still run normally. Default behavior is unchanged.
+
+Retained workloads and caches continue to incur costs. This flag does not prevent Helm
+from removing resources deliberately omitted from a changed chart; review the chart
+before a deployment that must preserve all existing resources. It applies to the CLI's
+post-cutover cleanup, not GitOps pruning or `destroy`. A later deployment without the
+flag resumes normal cleanup. Use it explicitly on both legs of a retention exercise.
+
 ## Rollback
 
 `npx adapter-k8s rollback` returns to the previous build: pools scale back up, the routing tier reverts to that build's image and manifest snapshot, and the Service selectors patch back. It is symmetric—running it again rolls forward. Recovery takes the routing image, dispatch Secret reference, and architecture from the live routing Deployment or its retained ReplicaSets, verifying controller ownership by Deployment UID. ConfigMap state cannot authorize a replacement image. Missing or conflicting workload history stops recovery before the routing Deployment changes. Keep the Deployment’s revision history (Kubernetes defaults to 10 retained revisions); deleting or recreating the Deployment also removes that rollback evidence. A legacy tag is usable only when workload history records it, with a warning that the tag may have moved.

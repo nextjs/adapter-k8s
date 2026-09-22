@@ -381,6 +381,13 @@ export async function runCutover(inputs: CutoverInputs, deps: CutoverDeps): Prom
     }
   }
 
+  if (inputs.skipCleanup) {
+    console.log(
+      "  → Post-cutover cleanup skipped; retained builds, autoscalers and cache resources continue to incur costs.",
+    );
+    return;
+  }
+
   // E5 (7f). Park the rollback target at zero, or one standby replica for retention.
   await scaleDownPreviousBuild({
     releaseName,
@@ -735,5 +742,11 @@ export async function runRevert(inputs: RevertInputs): Promise<void> {
   }
 
   // 5. State is durable; scale down every former-current Deployment (gc.ts).
-  await scaleDownCurrentBuild({ namespace, currentDeploys, replicas: retainCurrent ? 1 : 0 });
+  if (inputs.skipCleanup) {
+    console.log(
+      "  → Post-rollback cleanup skipped; the rolled-away build retains its running capacity.",
+    );
+  } else {
+    await scaleDownCurrentBuild({ namespace, currentDeploys, replicas: retainCurrent ? 1 : 0 });
+  }
 }

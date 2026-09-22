@@ -88,10 +88,13 @@ export function renderOriginService({
   releaseName,
   poolName,
   emitHealthCheckPolicy = false,
+  emitBackendPolicy = emitHealthCheckPolicy,
 }: {
   releaseName: string;
   poolName: string;
   emitHealthCheckPolicy?: boolean;
+  /** A composed GCPBackendPolicy for this Service owns all backend settings. */
+  emitBackendPolicy?: boolean;
 }): string {
   assertSafeReleaseName(releaseName);
   assertSafePoolName(poolName);
@@ -145,7 +148,7 @@ spec:
     group: ""
     kind: Service
     name: ${sanitizeK8sName(`${releaseName}-origin`)}
-${renderBackendPolicy(releaseName, "origin")}`
+${emitBackendPolicy ? renderBackendPolicy(releaseName, "origin") : ""}`
     : ""
 }
 `;

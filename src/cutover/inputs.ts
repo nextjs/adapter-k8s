@@ -63,6 +63,8 @@ export interface CutoverDeps {
  *   cluster-CM-only (state.ts, next phase).
  */
 export interface CutoverInputs {
+  /** Operator retains outgoing capacity and superseded resources after promotion. */
+  skipCleanup?: boolean;
   projectDir: string;
   /**
    * Which store(s) the E2 state commit writes. "dual" (default — the CLI path) keeps
@@ -129,6 +131,8 @@ export interface PoolDeploy {
  * them from the state CM's topologies + emit-metadata.
  */
 export interface RevertInputs {
+  /** Keep the rolled-away build and its autoscalers running after traffic reversal. */
+  skipCleanup?: boolean;
   projectDir: string;
   releaseName: string;
   namespace: string;

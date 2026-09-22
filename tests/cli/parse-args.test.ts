@@ -54,6 +54,7 @@ describe("parseArgs", () => {
         "--dry-run",
         "--skip-build",
         "--skip-push",
+        "--skip-cleanup",
         "--yes",
         "-y",
         "--allow-no-network-policy",
@@ -63,6 +64,7 @@ describe("parseArgs", () => {
     expect(flags["dry-run"]).toBe(true);
     expect(flags["skip-build"]).toBe(true);
     expect(flags["skip-push"]).toBe(true);
+    expect(flags["skip-cleanup"]).toBe(true);
     expect(flags["yes"]).toBe(true);
     expect(flags["y"]).toBe(true);
     expect(flags["allow-no-network-policy"]).toBe(true);

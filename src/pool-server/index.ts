@@ -3040,6 +3040,12 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     // were stripped), so they can be trusted here.
     const extOutputId = req.headers["x-output-id"] as string | undefined;
     const extMwEvaluated = req.headers["x-mw-evaluated"] as string | undefined;
+    const statusHeader = req.headers["x-mw-response-status"];
+    const extResponseStatus =
+      typeof statusHeader === "string" && /^[2-5][0-9]{2}$/.test(statusHeader)
+        ? Number(statusHeader)
+        : undefined;
+    const extResponseStatusValid = statusHeader === undefined || extResponseStatus !== undefined;
     const routeMatches = extRouteMatchesField.ok ? (extRouteMatchesField.value ?? null) : null;
     delete req.headers["x-mw-evaluated"];
     // Skip the pool's own middleware ONLY when the trusted upstream POSITIVELY asserts it
@@ -3052,7 +3058,8 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       (extOutputId || extExternalRewrite) &&
       extMwEvaluated &&
       MW_EVALUATED_TRUSTED.has(extMwEvaluated) &&
-      extDispatchMetadataValid
+      extDispatchMetadataValid &&
+      extResponseStatusValid
     ) {
       const pool = (req.headers["x-upstream-pool"] as string) ?? poolName;
 
@@ -3111,6 +3118,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         matchedPathname: extOutputId!, // guarded above; external rewrites returned separately
         routeMatches,
         resolvedHeaders: extResolvedHeaders,
+        responseStatus: extResponseStatus,
         // N40: the same field Phase 1 populates, so dispatch.ts's existing "apply middleware's
         // final request-header set as a REPLACEMENT, not a merge" block runs unchanged — and,
         // being upstream of the cross-pool proxy, the rewritten headers survive a pool hop

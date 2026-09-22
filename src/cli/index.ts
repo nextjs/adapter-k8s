@@ -24,6 +24,7 @@ const BOOLEAN_FLAGS = new Set([
   "dry-run",
   "skip-build",
   "skip-push",
+  "skip-cleanup",
   "yes",
   "y",
   "allow-no-network-policy",
@@ -182,6 +183,8 @@ Options:
   --standard               Provision a GKE Standard cluster instead of Autopilot (init)
   --skip-build             Skip next build (deploy, emulate)
   --skip-push              Skip docker build + push (deploy)
+  --skip-cleanup           Keep outgoing capacity and superseded resources after cutover
+                          (deploy, rollback); retained resources continue to incur costs
   --port <port>            Listener port for the local Envoy proxy (emulate; default: 8080)
   --yes, -y                Confirm an unpinned kubectl context (deploy, rollback, tail,
                               migrate, destroy)
@@ -401,6 +404,7 @@ async function main(): Promise<void> {
         // N30 / N29: opt out of the fatal routing-manifest retention, and skip the
         // unpinned-kubectl-context confirmation in CI.
         allowUnretainedManifest: flags["allow-unretained-manifest"] === true,
+        skipCleanup: flags["skip-cleanup"] === true,
         yes: flags["yes"] === true || flags["y"] === true,
         dryRun,
       });
@@ -421,6 +425,7 @@ async function main(): Promise<void> {
       await runRollback({
         projectDir,
         releaseName,
+        skipCleanup: flags["skip-cleanup"] === true,
         dryRun,
         yes: flags["yes"] === true || flags["y"] === true,
       });

@@ -62,6 +62,7 @@ export const NEVER_KEYED_DISPATCH_HEADERS: readonly string[] = [
   "x-nextjs-ppr",
   "x-resolved-headers",
   "x-mw-evaluated",
+  "x-mw-response-status",
   "x-invoke-path",
   "x-invoke-query",
   // Terminal target selected after cache lookup. The pre-cache request already carries the

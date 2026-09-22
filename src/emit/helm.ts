@@ -1,5 +1,6 @@
 // src/emit/helm.ts
 import { createHash } from "node:crypto";
+import { sanitizeK8sName } from "./templates/utils.js";
 import type { K8sAdapterConfig, PoolDefinition, RoutingManifest } from "../types.js";
 import { renderChartYaml } from "./templates/chart-yaml.js";
 import { renderInternalSecret } from "./templates/internal-secret.js";
@@ -233,10 +234,33 @@ export function generateHelmChart({
   // the provider interface — see plans/multi-provider-aks-eks-generic.md. Emitting nothing when
   // no gateway is configured stays the provider's decision, not this caller's.
   if (compiledTarget) {
+    // GKE attaches only one backend policy per Service. An exposure's explicit
+    // policy owns the whole backend configuration; adding our defaults alongside
+    // it creates a conflicting policy and can prevent traffic readiness.
+    const originName = sanitizeK8sName(`${releaseName}-origin`);
+    const originPolicies = compiledTarget.plan.operations.resources.objects.filter((object) => {
+      if (
+        object.apiVersion !== "networking.gke.io/v1" ||
+        object.kind !== "GCPBackendPolicy" ||
+        object.metadata.namespace !== compiledTarget.plan.metadata.namespace
+      )
+        return false;
+      const spec = object.body?.spec as
+        | { targetRef?: { group?: string; kind?: string; name?: string } }
+        | undefined;
+      return (
+        spec?.targetRef?.group === "" &&
+        spec.targetRef.kind === "Service" &&
+        spec.targetRef.name === originName
+      );
+    });
+    if (originPolicies.length > 1)
+      throw new Error(`Multiple GCPBackendPolicies target Service ${originName}`);
     files["templates/origin-service.yaml"] = renderOriginService({
       releaseName,
       poolName: defaultPool,
       emitHealthCheckPolicy: emitsOriginHealthCheckPolicy,
+      emitBackendPolicy: emitsOriginHealthCheckPolicy && originPolicies.length === 0,
     });
     files["templates/composition-plan.yaml"] = renderCompositionPlanConfigMap(compiledTarget.plan);
     Object.assign(files, renderComposedResources(compiledTarget.plan.operations.resources.objects));
