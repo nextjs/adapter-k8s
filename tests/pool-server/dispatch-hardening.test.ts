@@ -848,3 +848,25 @@ describe("PPR document detection uses the configured RSC header", () => {
     expect(localHandlerInvoker.mock.calls[0]![0].responsePrefix?.filePath).toContain("shell.html");
   });
 });
+
+describe("middleware rewrite response status", () => {
+  it.each([
+    [200, 401],
+    [302, 302],
+    [404, 404],
+    [500, 500],
+  ])("renders %s with status %s", (handlerStatus, expected) => {
+    const res = mockRes();
+    installResolvedResponseHeaders(res, new Headers({ "x-policy": "auth" }), 401);
+    res.writeHead(handlerStatus, { "content-type": "text/html" });
+    res.end("home page");
+    expect(res._status).toBe(expected);
+    expect(res._headers["x-policy"]).toBe("auth");
+  });
+  it("preserves status even when the rewrite carries no response headers", () => {
+    const res = mockRes();
+    installResolvedResponseHeaders(res, undefined, 401);
+    res.writeHead(200, {});
+    expect(res._status).toBe(401);
+  });
+});

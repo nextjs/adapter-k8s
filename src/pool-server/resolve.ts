@@ -39,6 +39,8 @@ export type ResolveResult =
       matchedPathname: string;
       routeMatches: Record<string, string> | null;
       resolvedHeaders: Headers | undefined;
+      /** Non-default status supplied by a same-deployment middleware rewrite. */
+      responseStatus?: number | undefined;
       middlewareRequestHeaders?: Headers | undefined;
       /** Rewritten path+query to invoke the handler with (middleware/config
        * rewrites). Absent when it equals the original request URL. */
@@ -100,6 +102,7 @@ export function createLocalResolver(
       inheritedMiddlewareRequestHeaders?: Headers | undefined,
     ): Promise<ResolveResult> {
       let middlewareResponse: Response | null = null;
+      let middlewareRewriteStatus: number | undefined;
       // Captures the mutated request headers from responseToMiddlewareResult.
       // This includes x-middleware-set-cookie, x-middleware-override-headers,
       // and x-middleware-request-* modifications — all applied in one place.
@@ -205,6 +208,8 @@ export function createLocalResolver(
 
                   if (response) {
                     middlewareResponse = response;
+                    if (response.headers.has("x-middleware-rewrite") && response.status !== 200)
+                      middlewareRewriteStatus = response.status;
                     const reqHeaders = new Headers(ctx.headers);
                     const mwResult = responseToMiddlewareResult(
                       response.clone(),
@@ -301,6 +306,7 @@ export function createLocalResolver(
           }
           return {
             ...rewritten,
+            responseStatus: middlewareRewriteStatus ?? rewritten.responseStatus,
             resolvedHeaders,
             middlewareRequestHeaders:
               rewritten.middlewareRequestHeaders ?? middlewareRequestHeaders ?? undefined,
@@ -437,6 +443,7 @@ export function createLocalResolver(
         kind: "route",
         pool,
         matchedPathname: finalMatchedPathname,
+        responseStatus: middlewareRewriteStatus,
         routeMatches: sanitizeRouteMatches(resolution.routeMatches),
         resolvedHeaders,
         middlewareRequestHeaders: middlewareRequestHeaders ?? undefined,

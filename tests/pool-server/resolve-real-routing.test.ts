@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createLocalResolver } from "../../src/pool-server/resolve.js";
+import { createRequestHandler } from "../../src/routing-service/handler.js";
 import type { RoutingManifest } from "../../src/types.js";
 
 const rsc = {
@@ -205,4 +206,61 @@ describe("createLocalResolver with real @next/routing", () => {
       expect(result.invokePath).toBe("/blog/x?slug=x");
     }
   });
+});
+
+describe("middleware rewrite status with real routing", () => {
+  it.each([200, 401, 403])(
+    "preserves explicit status %s through same-deployment continuation",
+    async (status) => {
+      const manifest: RoutingManifest = {
+        routeGraph: {
+          caseSensitive: true,
+          beforeMiddleware: [],
+          beforeFiles: [],
+          afterFiles: [],
+          dynamicRoutes: [],
+          onMatch: [],
+          fallback: [],
+          shouldNormalizeNextData: false,
+          rsc,
+        },
+        pathnames: ["/"],
+        poolAssignments: { "/": "default" },
+        middleware: { filePath: "middleware.js" },
+        buildId: "test",
+        basePath: "",
+        pprRoutes: {},
+        nextVersion: "16.3.3",
+      };
+      const resolver = createLocalResolver(manifest, {
+        handler: async () =>
+          new Response(null, { status, headers: { "x-middleware-rewrite": "http://localhost/" } }),
+      });
+      const result = await resolver.resolve(
+        new URL("http://localhost/private"),
+        new Headers(),
+        "GET",
+        new ReadableStream<Uint8Array>(),
+      );
+      expect(result.kind).toBe("route");
+      if (result.kind === "route") {
+        expect(result.invokePath).toBe("/");
+        expect(result.responseStatus).toBe(status === 200 ? undefined : status);
+      }
+      const extension = createRequestHandler(manifest, {
+        handler: async () =>
+          new Response(null, { status, headers: { "x-middleware-rewrite": "http://localhost/" } }),
+      });
+      const response = await extension([
+        { key: ":path", value: "/private" },
+        { key: ":method", value: "GET" },
+        { key: ":scheme", value: "http" },
+        { key: ":authority", value: "localhost" },
+      ]);
+      const statusHeader = response.requestHeaders?.response?.headerMutation?.setHeaders?.find(
+        (entry) => entry.header.key === "x-mw-response-status",
+      );
+      expect(statusHeader?.header.value).toBe(status === 200 ? undefined : String(status));
+    },
+  );
 });

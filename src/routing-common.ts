@@ -29,6 +29,7 @@ export const INTERNAL_DISPATCH_HEADERS = [
   "x-upstream-pool",
   "x-nextjs-ppr",
   "x-resolved-headers",
+  "x-mw-response-status",
   // Positive, secret-gated assertion that the middleware STAGE was evaluated upstream
   // (by the ext_proc routing service or a cross-pool proxy). The pool skips its own
   // middleware ONLY when this is present with a recognized value — never on the mere

@@ -405,6 +405,7 @@ export function createRequestHandler(
     }
 
     let middlewareResponse: Response | undefined;
+    let middlewareRewriteStatus: number | undefined;
     // N40 (SECURITY). Captures the mutated request headers from responseToMiddlewareResult —
     // the x-middleware-override-headers / x-middleware-request-* / x-middleware-set-cookie
     // verdict resolved into one authoritative REPLACEMENT set. Transported to the pool as
@@ -481,6 +482,11 @@ export function createRequestHandler(
 
               mwEvaluated = "ran";
               middlewareResponse = invoked.response;
+              if (
+                invoked.response?.headers.has("x-middleware-rewrite") &&
+                invoked.response.status !== 200
+              )
+                middlewareRewriteStatus = invoked.response.status;
               // N40 (SECURITY). responseToMiddlewareResult MUTATES the Headers it is handed
               // into the middleware's FINAL request-header set (applying
               // x-middleware-override-headers / x-middleware-request-* /
@@ -750,6 +756,8 @@ export function createRequestHandler(
     // middleware when this is one of the trusted verdicts (ran / skip-nomatch / none);
     // `error` (no callable found) leaves the pool to re-evaluate — closing the bypass.
     setDispatch("x-mw-evaluated", mwEvaluated);
+    if (middlewareRewriteStatus !== undefined)
+      setDispatch("x-mw-response-status", String(middlewareRewriteStatus));
 
     // x-output-id tells the pool server which handler to invoke directly,
     // bypassing local resolveRoutes() (avoids double resolution + middleware)

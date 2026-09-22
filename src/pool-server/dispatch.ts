@@ -916,8 +916,10 @@ export function applyMiddlewareRequestHeaders(
 export function installResolvedResponseHeaders(
   res: ServerResponse,
   resolvedHeaders: Headers | undefined,
+  responseStatus?: number,
 ): void {
-  if (!resolvedHeaders) return;
+  if (!resolvedHeaders && responseStatus === undefined) return;
+  resolvedHeaders ??= new Headers();
   const originalWriteHead = res.writeHead.bind(res);
   res.writeHead = ((status: number, ...args: unknown[]) => {
     const headersIndex = typeof args[0] === "string" ? 1 : 0;
@@ -931,7 +933,12 @@ export function installResolvedResponseHeaders(
         ? mergeResolvedHeadersIntoWebSocketFallback(resolvedHeaders, args[headersIndex])
         : mergeResolvedHeadersIntoHeadersArg(resolvedHeaders, args[headersIndex]);
     }
-    return Reflect.apply(originalWriteHead, res, [status, ...args]) as ServerResponse;
+    // Keep handler failures and redirects; a successful render must preserve the
+    // middleware rewrite verdict instead of turning an authentication error into 200.
+    return Reflect.apply(originalWriteHead, res, [
+      status === 200 ? (responseStatus ?? status) : status,
+      ...args,
+    ]) as ServerResponse;
   }) as typeof res.writeHead;
 }
 
@@ -2663,9 +2670,14 @@ export function createDispatcher(options: DispatcherOptions) {
         (resolution.kind === "route" ||
           resolution.kind === "not-found" ||
           resolution.kind === "external-rewrite") &&
-        resolution.resolvedHeaders
+        (resolution.resolvedHeaders ||
+          (resolution.kind === "route" && resolution.responseStatus !== undefined))
       ) {
-        installResolvedResponseHeaders(res, resolution.resolvedHeaders);
+        installResolvedResponseHeaders(
+          res,
+          resolution.resolvedHeaders,
+          resolution.kind === "route" ? resolution.responseStatus : undefined,
+        );
       }
 
       // Resolve the handler output id up front (shared by the static fast path
@@ -4290,6 +4302,7 @@ const ASSERTED_BY_THIS_HOP: Record<string, true> = {
   "x-route-matches": true,
   "x-mw-evaluated": true,
   "x-invoke-path": true,
+  "x-mw-response-status": true,
   "x-invoke-query": true,
   [INTERNAL_EXECUTION_DEADLINE_HEADER]: true,
   [INTERNAL_DISPATCH_PROOF_HEADER]: true,
@@ -4324,6 +4337,9 @@ function proxyToPool(
       // without these the target pool's dispatch has no rewrite target at all: the handler
       // would run with the ORIGINAL route's params and the rewrite-added query would be
       // silently dropped (same wire vocabulary the ext_proc routing service stamps).
+      ...(resolution.responseStatus !== undefined
+        ? { "x-mw-response-status": String(resolution.responseStatus) }
+        : {}),
       ...(resolution.invokePath ? { "x-invoke-path": resolution.invokePath } : {}),
       ...(resolution.invocationQuery
         ? { "x-invoke-query": JSON.stringify(resolution.invocationQuery) }
