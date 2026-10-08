@@ -51,7 +51,7 @@ describe("buildRoutingManifest", () => {
       basePath: "",
       i18n: null,
       trailingSlash: false,
-      nextVersion: "16.3.3",
+      nextVersion: "16.3.8",
       projectDir: "/app",
     };
 
@@ -91,7 +91,7 @@ describe("buildRoutingManifest", () => {
       basePath: "",
       i18n: null,
       trailingSlash: false,
-      nextVersion: "16.3.3",
+      nextVersion: "16.3.8",
       projectDir: "/app",
     });
 

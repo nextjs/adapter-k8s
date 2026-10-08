@@ -63,7 +63,7 @@ describe("createLocalResolver with real @next/routing", () => {
         "/nl-NL/company/about-us": "default",
       },
       pprRoutes: {},
-      nextVersion: "16.3.3",
+      nextVersion: "16.3.8",
     };
 
     const result = await createLocalResolver(manifest).resolve(
@@ -112,7 +112,7 @@ describe("createLocalResolver with real @next/routing", () => {
       buildId: "test",
       basePath: "",
       pprRoutes: {},
-      nextVersion: "16.3.3",
+      nextVersion: "16.3.8",
     };
     const result = await createLocalResolver(manifest).resolve(
       new URL(`http://localhost${pathname}`),
@@ -158,7 +158,7 @@ describe("createLocalResolver with real @next/routing", () => {
       middleware: null,
       poolAssignments: { "/blog/[slug]": "default" },
       pprRoutes: {},
-      nextVersion: "16.3.3",
+      nextVersion: "16.3.8",
     };
     const resolver = createLocalResolver(manifest);
     const body = () => new ReadableStream<Uint8Array>();
@@ -236,7 +236,7 @@ describe("createLocalResolver with real @next/routing", () => {
       middleware: null,
       poolAssignments: { "/blog/[slug]": "default" },
       pprRoutes: {},
-      nextVersion: "16.3.3",
+      nextVersion: "16.3.8",
     };
     const result = await createLocalResolver(manifest).resolve(
       new URL("http://localhost/start"),
@@ -275,7 +275,7 @@ describe("middleware rewrite status with real routing", () => {
         buildId: "test",
         basePath: "",
         pprRoutes: {},
-        nextVersion: "16.3.3",
+        nextVersion: "16.3.8",
       };
       const resolver = createLocalResolver(manifest, {
         handler: async () =>

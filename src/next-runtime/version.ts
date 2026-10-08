@@ -1,4 +1,4 @@
-export const SUPPORTED_NEXT_RELEASE_LINE = ">=16.3.3 <16.4.0";
+export const SUPPORTED_NEXT_RELEASE_LINE = ">=16.3.8 <16.4.0";
 export const PINNED_NEXT_CANARY = "16.3.0-canary.97";
 
 export type NextVersionSupport =
@@ -38,9 +38,10 @@ export function checkSupportedNextVersion(version: unknown): NextVersionSupport 
     return { supported: true, prerelease: true };
   }
 
-  // 16.3.3 includes the image-optimizer AVIF security mitigation (GHSA-2xp9-vwfh-vxw4).
-  if (Number(match[3]) < 3) {
-    return { supported: false, reason: "predates the required Next.js 16.3.3 security fixes" };
+  // 16.3.8 includes the required cache isolation and image-optimizer security fixes
+  // (GHSA-3w37-wq28-93x7, GHSA-4jqv-mc3x-m676, GHSA-cjq9-62q9-8jv4).
+  if (Number(match[3]) < 8) {
+    return { supported: false, reason: "predates the required Next.js 16.3.8 security fixes" };
   }
   return { supported: true, prerelease: false };
 }
