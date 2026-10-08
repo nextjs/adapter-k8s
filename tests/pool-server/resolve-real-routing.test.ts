@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { extractRouteParams } from "../../src/pool-server/dispatch.js";
 import { createLocalResolver } from "../../src/pool-server/resolve.js";
 import { createRequestHandler } from "../../src/routing-service/handler.js";
 import type { RoutingManifest } from "../../src/types.js";
@@ -78,6 +79,50 @@ describe("createLocalResolver with real @next/routing", () => {
       expect(result.invokePath).toBe(
         `${locale === "en" ? "" : `/${locale}`}/company/about-us?nextInternalLocale=${locale}`,
       );
+    }
+  });
+
+  it.each([
+    ["/en", { locale: "en" }],
+    ["/en/books/new", { locale: "en", slug: ["books", "new"] }],
+    ["/en/%5B%5B...slug%5D%5D", { locale: "en", slug: ["[[...slug]]"] }],
+  ])("preserves real optional catch-all resolution for %s", async (pathname, expected) => {
+    const template = "/[locale]/[[...slug]]";
+    const manifest: RoutingManifest = {
+      routeGraph: {
+        caseSensitive: true,
+        beforeMiddleware: [],
+        beforeFiles: [],
+        afterFiles: [],
+        dynamicRoutes: [
+          {
+            source: template,
+            sourceRegex: "^/(?<nxtPlocale>[^/]+?)(?:/(?<nxtPslug>.+?))?(?:/)?$",
+            destination: "/[locale]/[[...slug]]?nxtPlocale=$nxtPlocale&nxtPslug=$nxtPslug",
+          },
+        ],
+        onMatch: [],
+        fallback: [],
+        shouldNormalizeNextData: false,
+        rsc,
+      },
+      pathnames: [template],
+      poolAssignments: { [template]: "default" },
+      middleware: null,
+      buildId: "test",
+      basePath: "",
+      pprRoutes: {},
+      nextVersion: "16.3.3",
+    };
+    const result = await createLocalResolver(manifest).resolve(
+      new URL(`http://localhost${pathname}`),
+      new Headers(),
+      "GET",
+      new ReadableStream<Uint8Array>(),
+    );
+    expect(result.kind).toBe("route");
+    if (result.kind === "route") {
+      expect(extractRouteParams(template, result.routeMatches, pathname)).toEqual(expected);
     }
   });
 

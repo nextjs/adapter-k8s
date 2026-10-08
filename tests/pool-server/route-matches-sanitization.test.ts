@@ -123,3 +123,40 @@ describe("extractRouteParams sentinel filtering (the Phase-2 compensation)", () 
     ).toEqual({ id: "7" });
   });
 });
+
+describe("extractRouteParams partial fallback pathnames", () => {
+  it.each([
+    ["slug", ""],
+    ["slug", "/"],
+    ["filter-slugs", ""],
+  ])("recovers the parent without synthesizing omitted optional %s%s", (name, trailingSlash) => {
+    expect(
+      extractRouteParams(`/[locale]/[[...${name}]]`, {}, `/en/[[...${name}]]${trailingSlash}`),
+    ).toEqual({
+      locale: "en",
+    });
+  });
+
+  it.each([
+    ["/en", { locale: "en" }],
+    ["/en/books", { locale: "en", slug: ["books"] }],
+    ["/en/books/new/", { locale: "en", slug: ["books", "new"] }],
+    ["/en/[[...other]]", { locale: "en", slug: ["[[...other]]"] }],
+    ["/en/%5B%5B...slug%5D%5D", { locale: "en", slug: ["[[...slug]]"] }],
+  ])("preserves concrete pathname captures from %s", (pathname, expected) => {
+    expect(extractRouteParams("/[locale]/[[...slug]]", {}, pathname)).toEqual(expected);
+  });
+
+  it.each(["books/new", "[[...slug]]"])("preserves an explicit routed value %s", (slug) => {
+    expect(
+      extractRouteParams("/[locale]/[[...slug]]", { nxtPslug: slug }, "/en/[[...slug]]"),
+    ).toEqual({ locale: "en", slug: slug.split("/") });
+  });
+
+  it.each([
+    ["/[locale]/[slug]", "/en/[slug]", "[slug]"],
+    ["/[locale]/[...slug]", "/en/[...slug]", ["[...slug]"]],
+  ])("preserves required fallback captures for %s", (template, pathname, slug) => {
+    expect(extractRouteParams(template, {}, pathname)).toEqual({ locale: "en", slug });
+  });
+});
