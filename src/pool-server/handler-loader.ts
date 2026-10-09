@@ -2,6 +2,8 @@
 import { pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
 import path from "node:path";
+import type { ResponseCacheOwner } from "next/dist/server/lib/route-cache-key.js";
+import { PINNED_NEXT_CANARY } from "../next-runtime/version.js";
 import type { PoolManifest } from "../types.js";
 
 export type ArtifactRouteHandler = (...args: unknown[]) => unknown;
@@ -176,11 +178,12 @@ export function resolveUpgradeHandlerExport(
  */
 function unlatchResponseCache(
   module: LoadedModule,
-  responseCacheCtor: () => new (minimalMode: boolean) => unknown,
+  responseCacheCtor: () => new (minimalMode: boolean, owner?: ResponseCacheOwner) => unknown,
   rscHeader: string,
 ): void {
   type RouteModuleish = {
     getResponseCache?: (req: unknown) => unknown;
+    cacheOwner?: ResponseCacheOwner;
   };
   const candidates = module as {
     routeModule?: RouteModuleish;
@@ -199,7 +202,7 @@ function unlatchResponseCache(
     let rc = perMode.get(minimal);
     if (!rc) {
       const ResponseCacheCtor = responseCacheCtor();
-      rc = new ResponseCacheCtor(minimal);
+      rc = new ResponseCacheCtor(minimal, rm.cacheOwner);
       const inst = rc as { handleRevalidate?: HandleRevalidate };
       // Next 16.3's public get() normally reaches revalidate(), but a PPR prefetch miss calls
       // handleRevalidate() directly. Wrap the common conversion seam so both paths persist the
@@ -257,6 +260,7 @@ function unlatchResponseCache(
             try {
               await incrementalCache.set(key, out.value, {
                 cacheControl: out.cacheControl,
+                ...(rm.cacheOwner ? { route: rm.cacheOwner, kind: "APP_PAGE" } : {}),
                 isFallback,
                 isRoutePPREnabled: true,
               });
@@ -277,13 +281,30 @@ function unlatchResponseCache(
 }
 
 /** Resolve Next's ResponseCache class through the app's own Next.js module graph. */
-function defaultResponseCacheCtor(): new (minimalMode: boolean) => unknown {
+function defaultResponseCacheCtor(): new (
+  minimalMode: boolean,
+  owner?: ResponseCacheOwner,
+) => unknown {
   try {
     const req = createRequire(path.resolve(process.cwd(), "package.json"));
     const mod = req("next/dist/server/response-cache") as {
-      default?: new (minimalMode: boolean) => unknown;
+      default?: new (minimalMode: boolean, owner?: ResponseCacheOwner) => unknown;
     };
-    if (typeof mod.default === "function") return mod.default;
+    if (typeof mod.default === "function") {
+      const { version } = req("next/package.json") as { version: string };
+      if (version === PINNED_NEXT_CANARY) return mod.default;
+      const Ctor =
+        mod.default as unknown as typeof import("next/dist/server/response-cache/index.js").default;
+      // Preserve Next 16.3.8's module identity when replacing its per-module latch.
+      // A pathname alone loses App groups/slots and can cross route cache boundaries.
+      return class {
+        constructor(minimalMode: boolean, owner?: ResponseCacheOwner) {
+          if (!owner)
+            throw new Error("Unsupported Next.js route module: cacheOwner is unavailable");
+          return new Ctor({ minimalMode, route: owner });
+        }
+      };
+    }
     throw new Error("default export is not a constructor");
   } catch (error) {
     throw new Error(
@@ -297,12 +318,15 @@ export function createHandlerLoader(
   manifest: PoolManifest,
   loadModule: LoadModuleFn = (p) => import(pathToFileURL(path.resolve(process.cwd(), p)).href),
   options?: {
-    responseCacheCtor?: new (minimalMode: boolean) => unknown;
+    responseCacheCtor?: new (minimalMode: boolean, owner?: ResponseCacheOwner) => unknown;
     rscHeader?: string;
   },
 ) {
-  let resolvedCtor: (new (minimalMode: boolean) => unknown) | undefined;
-  const responseCacheCtor = (): new (minimalMode: boolean) => unknown => {
+  let resolvedCtor: (new (minimalMode: boolean, owner?: ResponseCacheOwner) => unknown) | undefined;
+  const responseCacheCtor = (): new (
+    minimalMode: boolean,
+    owner?: ResponseCacheOwner,
+  ) => unknown => {
     if (options?.responseCacheCtor) return options.responseCacheCtor;
     return (resolvedCtor ??= defaultResponseCacheCtor());
   };

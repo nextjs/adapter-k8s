@@ -334,7 +334,7 @@ ${declaration} {
       expect(events.find((event) => event.set)?.set).toEqual({
         kind: "IMAGE",
         revalidate: 5,
-        context: { cacheControl: { revalidate: 5 } },
+        context: { cacheControl: { revalidate: 5 }, kind: "IMAGE" },
       });
       expect(existsSync(path.join(distDir, "cache", "images"))).toBe(false);
     },

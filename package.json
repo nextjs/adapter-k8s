@@ -103,13 +103,13 @@
     "@types/node": "^25.5.0",
     "esbuild": "^0.28.2",
     "ioredis": "^5.11.1",
-    "oxfmt": "^0.42.0",
+    "oxfmt": "^0.72.0",
     "oxlint": "1.80.0",
     "typescript": "^6.0.2",
     "vitest": "^4.1.1"
   },
   "peerDependencies": {
-    "next": ">=16.3.3 <16.4.0"
+    "next": ">=16.3.8 <16.4.0"
   },
   "overrides": {
     "nanoid": "3.3.18"

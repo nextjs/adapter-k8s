@@ -434,6 +434,7 @@ describe("createHandlerLoader", () => {
 
   it("persists normal and prefetch PPR misses through Next's real minimal ResponseCache", async () => {
     const routeModule = {
+      cacheOwner: { kind: "APP_PAGE", sourceRoute: "/page" },
       getResponseCache: () => {
         throw new Error("original latch should have been replaced");
       },
@@ -501,6 +502,8 @@ describe("createHandlerLoader", () => {
       }),
       {
         cacheControl: { revalidate: 900, expire: 31_536_000 },
+        route: routeModule.cacheOwner,
+        kind: "APP_PAGE",
         isFallback: false,
         isRoutePPREnabled: true,
       },

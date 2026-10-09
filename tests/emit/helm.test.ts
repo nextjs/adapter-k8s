@@ -190,7 +190,7 @@ describe("generateHelmChart", () => {
     const result = generateHelmChart({
       pools: minimalPools(),
       buildId: "abc123",
-      nextVersion: "16.3.3",
+      nextVersion: "16.3.8",
       config,
       imageRegistry: "us-central1-docker.pkg.dev/cluster-project/nextjs",
       routingManifest: mockManifest,
@@ -235,7 +235,7 @@ describe("generateHelmChart", () => {
     const result = generateHelmChart({
       pools: minimalPools(),
       buildId: "abc123",
-      nextVersion: "16.3.3",
+      nextVersion: "16.3.8",
       config,
       imageRegistry: "ghcr.io/example/site",
       routingManifest: mockManifest,
@@ -284,7 +284,7 @@ describe("generateHelmChart", () => {
     const result = generateHelmChart({
       pools: minimalPools(),
       buildId: "abc123",
-      nextVersion: "16.3.3",
+      nextVersion: "16.3.8",
       config,
       imageRegistry: "us-central1-docker.pkg.dev/cluster-project/nextjs",
       routingManifest: mockManifest,
@@ -342,7 +342,7 @@ describe("generateHelmChart", () => {
         generateHelmChart({
           pools: minimalPools(),
           buildId: "abc123",
-          nextVersion: "16.3.3",
+          nextVersion: "16.3.8",
           config,
           imageRegistry: "us-central1-docker.pkg.dev/cluster-project/nextjs",
           routingManifest: mockManifest,
@@ -388,7 +388,7 @@ describe("generateHelmChart", () => {
     const result = generateHelmChart({
       pools: minimalPools(),
       buildId: "abc123",
-      nextVersion: "16.3.3",
+      nextVersion: "16.3.8",
       config,
       imageRegistry: "ghcr.io/example/site",
       routingManifest: mockManifest,
@@ -430,7 +430,7 @@ describe("generateHelmChart", () => {
     const result = generateHelmChart({
       pools: minimalPools(),
       buildId: "abc123",
-      nextVersion: "16.3.3",
+      nextVersion: "16.3.8",
       config,
       imageRegistry: "ghcr.io/example/site",
       routingManifest: mockManifest,

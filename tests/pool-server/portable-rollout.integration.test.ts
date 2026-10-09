@@ -103,7 +103,7 @@ function openEventStream(port: number, lastEventId?: string) {
       response.setEncoding("utf8");
       response.on("data", (chunk: string) => {
         pending += chunk.replaceAll("\r\n", "\n");
-        for (let boundary = pending.indexOf("\n\n"); boundary !== -1; ) {
+        for (let boundary = pending.indexOf("\n\n"); boundary !== -1;) {
           const record = pending.slice(0, boundary);
           pending = pending.slice(boundary + 2);
           const data: string[] = [];

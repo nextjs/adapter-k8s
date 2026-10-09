@@ -153,7 +153,7 @@ function writeStagedDir(): { dir: string; configDir: string } {
         "/echo-target": "main",
       },
       pprRoutes: {},
-      nextVersion: "16.3.3",
+      nextVersion: "16.3.8",
     }),
   );
   writeFileSync(

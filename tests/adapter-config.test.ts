@@ -48,7 +48,7 @@ describe("createK8sAdapter config normalization", () => {
           nextVersion: "16.4.0",
         } as any,
       ),
-    ).rejects.toThrow(/outside the supported Next\.js release line.*>=16\.3\.3 <16\.4\.0/s);
+    ).rejects.toThrow(/outside the supported Next\.js release line.*>=16\.3\.8 <16\.4\.0/s);
   });
 
   it("validates a directly supplied config", async () => {
@@ -364,7 +364,7 @@ describe("buildId validation at build time (H2)", () => {
         outputs: {},
         projectDir: "/nonexistent",
         config: {},
-        nextVersion: "16.3.3",
+        nextVersion: "16.3.8",
       } as any),
     ).rejects.toThrow(/Invalid buildId/);
   });
@@ -383,7 +383,7 @@ describe("buildId validation at build time (H2)", () => {
           outputs: {},
           projectDir: "/nonexistent",
           config: {},
-          nextVersion: "16.3.3",
+          nextVersion: "16.3.8",
         } as any),
       ).rejects.toThrow(/cannot be used as a Docker image tag/);
     },
@@ -398,7 +398,7 @@ describe("buildId validation at build time (H2)", () => {
         outputs: {},
         projectDir: "/nonexistent",
         config: {},
-        nextVersion: "16.3.3",
+        nextVersion: "16.3.8",
       } as any),
     ).rejects.toThrow(/generateBuildId/);
   });
@@ -431,7 +431,7 @@ describe("onBuildComplete build-time guards", () => {
       outputs: mockOutputs({ appPages: [mockAppPage({ pathname: "/" })] }),
       projectDir,
       config,
-      nextVersion: "16.3.3",
+      nextVersion: "16.3.8",
     }) as any;
 
   const writeInfra = (infra: Record<string, unknown>) => {
@@ -784,7 +784,7 @@ describe("onBuildComplete build-time guards", () => {
         outputs: mockOutputs({ appPages: [mockAppPage({ pathname: "/" })] }),
         projectDir: symbolDir,
         config: {},
-        nextVersion: "16.3.3",
+        nextVersion: "16.3.8",
       } as any),
     ).resolves.toBeUndefined();
     const gateway = readFileSync(
@@ -808,7 +808,7 @@ describe("onBuildComplete build-time guards", () => {
         outputs: mockOutputs({ appPages: [mockAppPage({ pathname: "/" })] }),
         projectDir: longDir,
         config: {},
-        nextVersion: "16.3.3",
+        nextVersion: "16.3.8",
       } as any),
     ).resolves.toBeUndefined();
     const gateway = readFileSync(

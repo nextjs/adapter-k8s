@@ -1827,7 +1827,7 @@ export function extractRouteParams(
   // executable handler template also needs the already-specialized root param `lang`.
   // Recover only missing values from the concrete invocation pathname.
   if (concretePathname && matchedPathname.includes("[")) {
-    const names: { name: string; catchAll: boolean }[] = [];
+    const names: { name: string; catchAll: boolean; optional?: boolean }[] = [];
     let pattern = "";
     const templatePathname = matchedPathname.endsWith(".rsc")
       ? matchedPathname.slice(0, -".rsc".length)
@@ -1842,7 +1842,7 @@ export function extractRouteParams(
       const catchAll = /^\[\.\.\.(.+)\]$/.exec(segment);
       const dynamic = /^\[(.+)\]$/.exec(segment);
       if (optionalCatchAll) {
-        names.push({ name: optionalCatchAll[1]!, catchAll: true });
+        names.push({ name: optionalCatchAll[1]!, catchAll: true, optional: true });
         pattern += "(?:/(.*))?";
       } else if (catchAll) {
         names.push({ name: catchAll[1]!, catchAll: true });
@@ -1856,10 +1856,15 @@ export function extractRouteParams(
     }
     const concreteMatch = new RegExp(`^${pattern}/?$`).exec(concretePathname);
     if (concreteMatch) {
-      names.forEach(({ name, catchAll }, index) => {
+      names.forEach(({ name, catchAll, optional }, index) => {
         if (params[name] !== undefined) return;
         const raw = concreteMatch[index + 1];
         if (raw === undefined || raw === "") return;
+        // A partially specialized fallback pathname can retain an omitted optional
+        // catch-all's template. Recover concrete parent params without turning that
+        // template into request data (adapter-vercel #126). Only filter synthesized
+        // values: explicit routeMatches above and encoded client values stay intact.
+        if (optional && raw.replace(/\/+$/, "") === `[[...${name}]]`) return;
         const decode = (value: string) => {
           try {
             return decodeURIComponent(value);
