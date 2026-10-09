@@ -128,7 +128,7 @@ async function build() {
     repoRoot: projectDir,
     distDir,
     config: {},
-    nextVersion: "16.3.3",
+    nextVersion: "16.3.8",
   } as never);
 }
 

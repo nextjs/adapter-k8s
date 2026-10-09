@@ -10,6 +10,8 @@ import type {
 import type { RouteKind } from "next/dist/server/route-kind.js";
 import { imageVariantKey, type ImageParams, type OptimizedImage } from "./image-optimizer.js";
 
+import { PINNED_NEXT_CANARY } from "./version.js";
+
 const DEFAULT_DISK_CACHE_BYTES = 256 * 1024 * 1024;
 
 export async function createImageCache({
@@ -88,7 +90,15 @@ export async function createImageCache({
     nextConfig: cacheConfig,
     ...(cacheHandler ? { cacheHandler } : {}),
   });
-  const responseCache = new ResponseCache(false);
+  // Next 16.3.8 requires a source route for cache isolation. The pinned
+  // conformance canary still has the positional minimalMode constructor.
+  const { version } = appRequire("next/package.json") as { version: string };
+  const responseCache =
+    version === PINNED_NEXT_CANARY
+      ? new (ResponseCache as unknown as new (
+          minimalMode: boolean,
+        ) => InstanceType<typeof ResponseCache>)(false)
+      : new ResponseCache({ minimalMode: false, route: "image" });
 
   return {
     async get(

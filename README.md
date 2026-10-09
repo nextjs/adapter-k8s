@@ -65,7 +65,7 @@ ordinary process redundancy, not the same cache, routing, and release protocol.
 ## Requirements
 
 - Node.js >= 20.16.0 on Node 20, or >= 22.3.0 on Node 22 and newer
-- Next.js >= 16.3.3 and < 17.0.0. The tested range is >= 16.3.3 and < 16.4.0;
+- Next.js >= 16.3.8 and < 17.0.0. The tested range is >= 16.3.8 and < 16.4.0;
   newer stable 16.x minors warn at build time and pool startup until verified. Versions outside
   the accepted range and unpinned prereleases error by default. Set
   `ADAPTER_K8S_ALLOW_UNSUPPORTED_NEXT=1` in the build and runtime environments to turn those

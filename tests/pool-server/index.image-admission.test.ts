@@ -211,7 +211,7 @@ export async function proxy(request) {
       },
       poolAssignments: {},
       pprRoutes: {},
-      nextVersion: "16.3.3",
+      nextVersion: "16.3.8",
     }),
   );
   writeFileSync(path.join(configDir, "static-assets.json"), JSON.stringify([]));

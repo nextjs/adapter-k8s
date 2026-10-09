@@ -23,7 +23,7 @@ const routingManifest = {
   middleware: null,
   poolAssignments: { "/": "default" },
   pprRoutes: {},
-  nextVersion: "16.3.3",
+  nextVersion: "16.3.8",
 } as unknown as RoutingManifest;
 
 const pools = new Map<string, PoolDefinition>([

@@ -108,7 +108,7 @@ describe("instrumentation.js register() that throws", () => {
         middleware: null,
         poolAssignments: {},
         pprRoutes: {},
-        nextVersion: "16.3.3",
+        nextVersion: "16.3.8",
       }),
     );
     staged = { dir, configDir };
