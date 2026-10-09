@@ -65,8 +65,11 @@ ordinary process redundancy, not the same cache, routing, and release protocol.
 ## Requirements
 
 - Node.js >= 20.16.0 on Node 20, or >= 22.3.0 on Node 22 and newer
-- Next.js >= 16.3.3 and < 16.4.0. Each Next.js release line is reviewed before this bound widens;
-  the runtime rejects artifacts built outside it. The pinned 16.3 canary used by upstream
+- Next.js >= 16.3.3 and < 17.0.0. The tested range is >= 16.3.3 and < 16.4.0;
+  newer stable 16.x minors warn at build time and pool startup until verified. Versions outside
+  the accepted range and unpinned prereleases error by default. Set
+  `ADAPTER_K8S_ALLOW_UNSUPPORTED_NEXT=1` in the build and runtime environments to turn those
+  errors into warnings for compatibility testing. The pinned 16.3 canary used by upstream
   conformance is an explicitly experimental verification lane, not part of the stable promise.
 - Kubernetes >= 1.33 with the APIs required by the selected target components. This is the
   adapter's schema compatibility floor, not an upstream security-support promise; use a currently

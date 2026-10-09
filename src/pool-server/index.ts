@@ -1352,7 +1352,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     routingManifest.nextVersion,
     `Routing manifest at ${routingManifestPath}`,
   );
-  if (nextSupport.prerelease) {
+  if (nextSupport.prerelease && !nextSupport.warning) {
     console.warn(
       `[pool-server] Next.js ${routingManifest.nextVersion} is accepted for the pinned ` +
         `upstream conformance lane; stable releases support ${SUPPORTED_NEXT_RELEASE_LINE}.`,

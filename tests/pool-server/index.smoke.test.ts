@@ -430,12 +430,12 @@ describe("pool-server startup smoke test", () => {
     }
   });
 
-  it("refuses to start an artifact from an unreviewed Next.js release line", async () => {
-    const stagedB = writeStagedDir(false, "nodejs", "16.4.0");
+  it("refuses to start an artifact from an unsupported Next.js major", async () => {
+    const stagedB = writeStagedDir(false, "nodejs", "17.0.0");
     const previousConfigDir = process.env.CONFIG_DIR;
     process.env.CONFIG_DIR = stagedB.configDir;
     try {
-      await expect(startPoolServer()).rejects.toThrow(/supports >=16\.3\.3 <16\.4\.0/);
+      await expect(startPoolServer()).rejects.toThrow(/supports >=16\.3\.3 <17\.0\.0/);
     } finally {
       process.env.CONFIG_DIR = previousConfigDir;
       rmSync(stagedB.dir, { recursive: true, force: true });

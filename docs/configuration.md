@@ -24,6 +24,19 @@ Per-pool options beyond `routes` and `scaling`:
 
 `defaultPool` names the pool that hosts the stable portable origin; it defaults to the first declared pool.
 
+## Next.js compatibility testing
+
+Set `ADAPTER_K8S_ALLOW_UNSUPPORTED_NEXT=1` to turn the adapter's Next.js version-guard
+errors into warnings. Only the exact value `1` enables the override. The warning retains
+why the version was rejected; compatibility is still unverified, and other build/runtime
+validation remains active. This also overrides the minimum-version check.
+
+Set it in the environment running `next build` and in the pool containers when testing
+unsupported artifacts. A build-time override is not persisted into the artifact. For
+containers, use `env: { ADAPTER_K8S_ALLOW_UNSUPPORTED_NEXT: "1" }` in the adapter config.
+Without the variable, the default version policy applies again. This override does not
+change npm's peer dependency constraints.
+
 ## Environment variables
 
 `.env` files are never staged into an image — they routinely hold secrets, and an image layer is a poor place for one. Runtime environment is supplied to the containers instead:
