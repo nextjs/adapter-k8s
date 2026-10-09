@@ -1,18 +1,70 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   PINNED_NEXT_CANARY,
+  NEXT_VERSION_OVERRIDE_ENV,
   SUPPORTED_NEXT_RELEASE_LINE,
+  TESTED_NEXT_RELEASE_LINE,
   assertSupportedNextVersion,
   checkSupportedNextVersion,
 } from "../../src/next-runtime/version.js";
 
 describe("supported Next.js runtime release line", () => {
+  beforeEach(() => {
+    vi.stubEnv(NEXT_VERSION_OVERRIDE_ENV, undefined);
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+
+  it.each(["17.0.0", "16.4.0-canary.1", "16.3.2", "invalid", undefined])(
+    "turns rejection of %s into a visible warning with the explicit override",
+    (version) => {
+      vi.stubEnv(NEXT_VERSION_OVERRIDE_ENV, "1");
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      // The policy check still reports the incompatibility; only enforcement is overridden.
+      expect(checkSupportedNextVersion(version).supported).toBe(false);
+      expect(assertSupportedNextVersion(version, "test manifest")).toMatchObject({
+        supported: true,
+        prerelease: version === "16.4.0-canary.1",
+      });
+      expect(warn).toHaveBeenCalledExactlyOnceWith(
+        expect.stringContaining(`Continuing because ${NEXT_VERSION_OVERRIDE_ENV}=1`),
+      );
+    },
+  );
+
+  it.each(["0", "true", "yes", ""])("keeps enforcement for override value %j", (value) => {
+    vi.stubEnv(NEXT_VERSION_OVERRIDE_ENV, value);
+    expect(() => assertSupportedNextVersion("17.0.0", "test manifest")).toThrow(
+      /outside the supported Next.js release line/,
+    );
+  });
+
   it.each(["16.3.8", "16.3.9", "16.3.10"])("accepts %s", (version) => {
     expect(checkSupportedNextVersion(version)).toEqual({ supported: true, prerelease: false });
     expect(() => assertSupportedNextVersion(version, "test manifest")).not.toThrow();
   });
+
+  it.each(["16.4.0", "16.4.1", "16.5.0", "16.99.0+build.1"])(
+    "warns but accepts untested stable %s",
+    (version) => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        expect(assertSupportedNextVersion(version, "test manifest")).toMatchObject({
+          supported: true,
+          prerelease: false,
+        });
+        expect(warn).toHaveBeenCalledExactlyOnceWith(
+          expect.stringContaining(`outside the tested Next.js range ${TESTED_NEXT_RELEASE_LINE}`),
+        );
+      } finally {
+        warn.mockRestore();
+      }
+    },
+  );
 
   it("accepts the pinned 16.3 canary conformance lane deliberately", () => {
     expect(checkSupportedNextVersion(PINNED_NEXT_CANARY)).toEqual({
@@ -31,7 +83,7 @@ describe("supported Next.js runtime release line", () => {
     "16.3.5",
     "16.3.6",
     "16.3.7",
-    "16.4.0",
+    "16.4.0-canary.1",
     "17.0.0",
     "canary",
     "16.3",
@@ -58,7 +110,7 @@ describe("supported Next.js runtime release line", () => {
 
     expect(pkg.peerDependencies.next).toBe(SUPPORTED_NEXT_RELEASE_LINE);
     expect(pkg.engines.node).toBe(">=20.16.0 <21 || >=22.3.0");
-    expect(readme).toContain("Next.js >= 16.3.8 and < 16.4.0");
+    expect(readme).toContain("Next.js >= 16.3.8 and < 17.0.0");
     expect(readme).toContain("Node.js >= 20.16.0 on Node 20, or >= 22.3.0");
   });
 });

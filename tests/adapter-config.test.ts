@@ -37,7 +37,28 @@ describe("createK8sAdapter config normalization", () => {
     },
   );
 
-  it("rejects an unreviewed Next.js release before modifying the build config", async () => {
+  it("warns and continues building with an untested stable Next.js minor", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const adapter = createK8sAdapter(validConfig);
+      await expect(
+        adapter.modifyConfig!(
+          {} as any,
+          {
+            phase: "phase-production-build",
+            nextVersion: "16.4.0",
+          } as any,
+        ),
+      ).resolves.toBeDefined();
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining("compatibility has not been verified"),
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("rejects an unsupported Next.js major before modifying the build config", async () => {
     const adapter = createK8sAdapter(validConfig);
 
     await expect(
@@ -45,10 +66,10 @@ describe("createK8sAdapter config normalization", () => {
         {} as any,
         {
           phase: "phase-production-build",
-          nextVersion: "16.4.0",
+          nextVersion: "17.0.0",
         } as any,
       ),
-    ).rejects.toThrow(/outside the supported Next\.js release line.*>=16\.3\.8 <16\.4\.0/s);
+    ).rejects.toThrow(/outside the supported Next\.js release line.*>=16\.3\.8 <17\.0\.0/s);
   });
 
   it("validates a directly supplied config", async () => {

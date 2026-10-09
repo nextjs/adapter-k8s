@@ -702,6 +702,14 @@ describe("shared-image strategy (#30)", () => {
 // produced a different chart — no way to audit invariant 5 — and rotated the dispatch secret
 // out from under the pods that were still serving (middleware then ran twice per request).
 describe("reproducible emit (#20)", () => {
+  beforeEach(() => {
+    // These tests compare chart/metadata emission and persisted key reuse, not image contents.
+    // Full staging copies the host's Sharp binaries twice per test; unrelated staging I/O can
+    // exhaust the 5s timeout under CI contention. Keep real emission and
+    // filesystem persistence, with Docker context staging covered by the suites above.
+    process.env.ADAPTER_K8S_SKIP_STAGING = "1";
+  });
+
   it("re-emitting the same build produces the same secret and metadata", async () => {
     seedProject();
     await build();
