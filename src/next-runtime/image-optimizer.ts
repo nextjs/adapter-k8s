@@ -5,6 +5,7 @@ import path from "node:path";
 import type { ImageConfigComplete } from "next/dist/shared/lib/image-config.js";
 import type { NextConfigRuntime } from "next/dist/server/config-shared.js";
 import type * as ImageOptimizer from "next/dist/server/image-optimizer.js";
+import { loadImageHashHelpers, loadImageSharp } from "./image-helpers.js";
 
 export type ImageConfig = ImageConfigComplete;
 type ImageLocalPattern = NonNullable<ImageConfig["localPatterns"]>[number];
@@ -109,6 +110,7 @@ function loadImageConfig(images: Record<string, any>, defaults: ImageConfig): Im
 export function createImageOptimizer(projectDir: string, distDir: string) {
   const appRequire = createRequire(path.join(projectDir, "package.json"));
   const upstream = appRequire("next/dist/server/image-optimizer") as typeof ImageOptimizer;
+  const { extractEtag } = loadImageHashHelpers(appRequire);
   const { defaultConfig } = appRequire(
     "next/dist/server/config-shared",
   ) as typeof import("next/dist/server/config-shared.js");
@@ -168,7 +170,8 @@ export function createImageOptimizer(projectDir: string, distDir: string) {
       // should silently serve originals. Memoize failures too (canary.97 incident).
       if (sharpReady === undefined) {
         try {
-          upstream.getSharp(
+          loadImageSharp(
+            appRequire,
             config.experimental.imgOptConcurrency,
             config.experimental.imgOptOperationCache,
           );
@@ -180,7 +183,7 @@ export function createImageOptimizer(projectDir: string, distDir: string) {
       }
       if (!sharpReady) throw new upstream.ImageError(503, "Image optimization unavailable");
       return upstream.imageOptimizer(
-        { buffer, contentType, cacheControl, etag: upstream.extractEtag(etag, buffer) },
+        { buffer, contentType, cacheControl, etag: extractEtag(etag, buffer) },
         params,
         config,
         { isDev: false, silent: true, ...(previousCacheEntry ? { previousCacheEntry } : {}) },

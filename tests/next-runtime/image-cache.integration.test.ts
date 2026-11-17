@@ -17,7 +17,10 @@ import {
 
 const require = createRequire(import.meta.url);
 const { defaultConfig } = require("next/dist/server/config-shared");
-const { getHash, ImageOptimizerCache } = require("next/dist/server/image-optimizer");
+const { ImageOptimizerCache } = require("next/dist/server/image-optimizer");
+const { getHash } = require("next/dist/server/image-optimizer").getHash
+  ? require("next/dist/server/image-optimizer")
+  : require("next/dist/server/image-optimizer/extract-etag");
 const REPO_ROOT = process.cwd();
 
 function docker(args: string[]): string {
