@@ -77,6 +77,13 @@ RUN npm install --prefix /tmp/adapter-k8s-sharp --no-save --no-audit --no-fund \
 `;
 }
 
+// npm is needed only for the optional build-time sharp fallback. Runtime entrypoints
+// execute Node directly; carrying package-manager dependencies leaves unrelated CVEs
+// in every app/routing image even when the Node executable itself is patched.
+const runtimeToolingCleanup = `RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack \\
+    /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack
+`;
+
 export function generateDockerfile({
   containerStrategy: _containerStrategy,
   targetPlatform = DEFAULT_TARGET_PLATFORM,
@@ -103,7 +110,7 @@ export function generateDockerfile({
   return `${middleCacheBuild(".", middleCache)}FROM ${baseImageRef()}
 ${middleCacheCopy(middleCache)}WORKDIR /app
 COPY --chown=node:node . .
-${sharpInstall}ENV NODE_ENV=production
+${sharpInstall}${runtimeToolingCleanup}ENV NODE_ENV=production
 ENV NEXT_BUILD_ID=${buildId}
 ENV CONFIG_DIR=/app/config
 EXPOSE 3000
@@ -140,7 +147,7 @@ export function generatePoolDockerfile({
   return `${middleCacheBuild("context", middleCache)}FROM ${baseImageRef()}
 ${middleCacheCopy(middleCache)}WORKDIR /app
 COPY --chown=node:node context/ .
-${sharpInstall}ENV NODE_ENV=production
+${sharpInstall}${runtimeToolingCleanup}ENV NODE_ENV=production
 ENV POOL_NAME=${poolName}
 ENV NEXT_BUILD_ID=${buildId}
 ENV CONFIG_DIR=/app/config
@@ -167,7 +174,7 @@ export function generatePoolBaseDockerfile({
   return `${middleCacheBuild("content", middleCache)}FROM ${baseImageRef()}
 ${middleCacheCopy(middleCache)}WORKDIR /app
 COPY --chown=node:node dependencies/ .
-${sharpInstall}COPY --chown=node:node content/ .
+${sharpInstall}${runtimeToolingCleanup}COPY --chown=node:node content/ .
 COPY --chown=node:node fetch-cache/ .
 ENV NODE_ENV=production
 ENV NEXT_BUILD_ID=${buildId}
@@ -212,7 +219,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends openssl \\
  && rm -rf /var/lib/apt/lists/*
 COPY --chown=node:node context/ .
-ENV NODE_ENV=production
+${runtimeToolingCleanup}ENV NODE_ENV=production
 ENV NEXT_BUILD_ID=${buildId}
 ENV CONFIG_DIR=/app/config
 # S1 (SECURITY). The IMMUTABLE, build-authored copy of this build's routing manifest.

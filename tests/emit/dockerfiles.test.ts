@@ -258,3 +258,36 @@ describe("emitted Dockerfile hygiene (survey batch 2)", () => {
     );
   });
 });
+
+describe("runtime package-manager cleanup", () => {
+  const options = { buildId: "tooling-cleanup", installSharpVersion: "0.34.5" };
+  it.each([
+    ["shared image", () => generateDockerfile({ ...options, containerStrategy: "shared-image" })],
+    ["pool image", () => generatePoolDockerfile({ ...options, poolName: "ssr" })],
+    ["pool parent", () => generatePoolBaseDockerfile(options)],
+  ])("keeps npm available for sharp, then removes it from the %s", (_name, generate) => {
+    const dockerfile = generate();
+    const cleanup = dockerfile.indexOf("RUN rm -rf /usr/local/lib/node_modules/npm");
+    expect(cleanup).toBeGreaterThan(dockerfile.indexOf("npm cache clean --force"));
+    expect(cleanup).toBeLessThan(dockerfile.indexOf("USER node"));
+    expect(dockerfile.slice(cleanup)).not.toContain("npm install");
+    for (const path of [
+      "/usr/local/lib/node_modules/corepack",
+      "/usr/local/bin/npm",
+      "/usr/local/bin/npx",
+      "/usr/local/bin/corepack",
+    ]) {
+      expect(dockerfile.slice(cleanup)).toContain(path);
+    }
+    expect(dockerfile).toContain('CMD ["node", "pool-server.cjs"]');
+  });
+
+  it("removes package-manager tooling from the routing image while retaining openssl", () => {
+    const dockerfile = generateRoutingServiceDockerfile({ buildId: "tooling-cleanup" });
+    expect(dockerfile).toContain("apt-get install -y --no-install-recommends openssl");
+    expect(dockerfile.indexOf("RUN rm -rf /usr/local/lib/node_modules/npm")).toBeLessThan(
+      dockerfile.indexOf("USER node"),
+    );
+    expect(dockerfile).toContain('CMD ["node", "routing-service.cjs"]');
+  });
+});
