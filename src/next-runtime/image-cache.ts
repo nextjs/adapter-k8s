@@ -9,6 +9,7 @@ import type {
 } from "next/dist/server/response-cache/index.js";
 import type { RouteKind } from "next/dist/server/route-kind.js";
 import { imageVariantKey, type ImageParams, type OptimizedImage } from "./image-optimizer.js";
+import { loadImageHashHelpers } from "./image-helpers.js";
 
 import { PINNED_NEXT_CANARY } from "./version.js";
 
@@ -26,9 +27,10 @@ export async function createImageCache({
   config: NextConfigRuntime;
 }) {
   const appRequire = createRequire(path.join(projectDir, "package.json"));
-  const { ImageOptimizerCache, getHash } = appRequire(
+  const { ImageOptimizerCache } = appRequire(
     "next/dist/server/image-optimizer",
   ) as typeof import("next/dist/server/image-optimizer.js");
+  const { getHash } = loadImageHashHelpers(appRequire);
   const { default: ResponseCache } = appRequire(
     "next/dist/server/response-cache",
   ) as typeof import("next/dist/server/response-cache/index.js");
@@ -143,7 +145,7 @@ export async function createImageCache({
           waitUntil,
         },
       );
-      if (entry?.value?.kind !== "IMAGE") {
+      if (!entry || !("value" in entry) || entry.value?.kind !== "IMAGE") {
         throw new Error("Image response cache returned no image");
       }
       return {
